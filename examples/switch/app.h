@@ -31,6 +31,21 @@ struct chat_turn {
     std::string assistant;
 };
 
+// Snapshot of the part of the memory that cannot be rolled back (recurrent state of recurrent/hybrid models).
+struct chat_kv_checkpoint {
+    size_t n_tokens = 0;       // number of leading cached tokens it covers
+    std::vector<uint8_t> data;
+};
+
+// Bookkeeping of what generate.cpp left in the KV cache (sequence 0) of a llama_context.
+// Validated on every reply against the live context, so it is safe to leave stale after unload/reload.
+struct chat_kv_cache {
+    const llama_context * ctx = nullptr;         // context the tokens below belong to
+    std::vector<llama_token> tokens;             // tokens at positions 0..n-1
+    size_t first_turn = 0;                       // oldest chat_turns index still in the prompt window
+    std::vector<chat_kv_checkpoint> checkpoints; // oldest first
+};
+
 struct app_state {
     std::vector<model_entry> models;
     size_t selected_model = 0;
@@ -46,6 +61,7 @@ struct app_state {
     ggml_threadpool * threadpool = nullptr; // owned by engine.cpp, attached to ctx
     std::string loaded_model_path;
     std::vector<chat_turn> chat_turns;
+    chat_kv_cache kv_cache; // owned by generate.cpp
 
     // engine settings of the loaded model, filled by load_model (reset by unload_model)
     double   load_ms   = 0.0;   // wall time of the last successful load_model

@@ -30,7 +30,7 @@ int main(int argc, char ** argv) {
         state.models = default_models();
         state.status = "Using fallback model list: " + err;
     } else {
-        state.status = "Loaded models from JSON";
+        state.status = "Loaded " + std::to_string(state.models.size()) + " models from models.json";
     }
     if (!state.models.empty()) {
         apply_selected_model_defaults(state);

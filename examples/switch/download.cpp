@@ -6,20 +6,34 @@
 #include <switch.h>
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
-#include <sstream>
 
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static bool g_socket_initialized = false;
 static bool g_ssl_initialized    = false;
+
+// socket reads: TLS records are at most 16 KB, so one ssl read never returns more than that anyway
+constexpr size_t   k_read_buf_size   = 256 * 1024;
+constexpr u32      k_ssl_io_max      = 0x8000;
+constexpr size_t   k_tls_record_max  = 16 * 1024;
+// stdio buffer for the .part file: SD card writes are much faster in large blocks
+constexpr size_t   k_write_buf_size  = 2 * 1024 * 1024;
+// how long the connection may deliver nothing before the download fails
+constexpr int      k_poll_ms         = 250;
+constexpr int      k_stall_limit_ms  = 60 * 1000;
+// keep some room on the SD card for the model list, logs, and FAT bookkeeping
+constexpr uint64_t k_free_margin     = 16ull * 1024 * 1024;
+constexpr int      k_max_redirects   = 6;
 
 std::string normalize_hf_url(std::string url) {
     const std::string blob = "/blob/main/";
@@ -29,6 +43,39 @@ std::string normalize_hf_url(std::string url) {
         url.replace(blob_pos, blob.size(), "/resolve/main/");
     }
     return url;
+}
+
+static bool stat_file_size(const std::string & path, uint64_t & size) {
+    struct stat st {};
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    size = (uint64_t) st.st_size;
+    return true;
+}
+
+uint64_t download_part_size(const std::string & destination) {
+    uint64_t size = 0;
+    if (!stat_file_size(download_part_path(destination), size)) {
+        return 0;
+    }
+    return size;
+}
+
+bool download_free_space(const std::string & path, uint64_t & free_bytes) {
+    if (path.rfind("sdmc:/", 0) != 0) {
+        return false;
+    }
+    FsFileSystem * fs = fsdevGetDeviceFileSystem("sdmc");
+    if (!fs) {
+        return false;
+    }
+    s64 free_space = 0;
+    if (R_FAILED(fsFsGetFreeSpace(fs, "/", &free_space)) || free_space < 0) {
+        return false;
+    }
+    free_bytes = (uint64_t) free_space;
+    return true;
 }
 
 namespace {
@@ -106,9 +153,15 @@ bool ensure_socket_service(std::string & err) {
     if (g_socket_initialized) {
         return true;
     }
-    Result rc = socketInitializeDefault();
+    // a larger TCP receive window keeps the Wi-Fi link busy on high-latency CDN connections
+    SocketInitConfig cfg = *socketGetDefaultInitConfig();
+    cfg.tcp_rx_buf_max_size = std::max<u32>(cfg.tcp_rx_buf_max_size, 0x80000);
+    Result rc = socketInitialize(&cfg);
     if (R_FAILED(rc)) {
-        err = "socketInitializeDefault failed: " + rc_to_hex(rc);
+        rc = socketInitializeDefault();
+    }
+    if (R_FAILED(rc)) {
+        err = "socket service init failed (rc " + rc_to_hex(rc) + ")";
         return false;
     }
     g_socket_initialized = true;
@@ -121,11 +174,42 @@ bool ensure_ssl_service(std::string & err) {
     }
     Result rc = sslInitialize(3);
     if (R_FAILED(rc)) {
-        err = "sslInitialize failed: " + rc_to_hex(rc);
+        err = "ssl service init failed (rc " + rc_to_hex(rc) + ")";
         return false;
     }
     g_ssl_initialized = true;
     return true;
+}
+
+// Asks nifm whether the console has an internet connection.
+// Only used to explain a network failure, so an unavailable service just yields "unknown".
+enum internet_state {
+    INTERNET_STATE_UNKNOWN,
+    INTERNET_STATE_CONNECTED,
+    INTERNET_STATE_OFFLINE,
+};
+
+internet_state query_internet_state() {
+    if (R_FAILED(nifmInitialize(NifmServiceType_User))) {
+        return INTERNET_STATE_UNKNOWN;
+    }
+    NifmInternetConnectionType   type     = {};
+    NifmInternetConnectionStatus status   = {};
+    u32                          strength = 0;
+    const Result rc = nifmGetInternetConnectionStatus(&type, &strength, &status);
+    nifmExit();
+    // the call itself fails when there is no network connection at all
+    if (R_FAILED(rc) || status != NifmInternetConnectionStatus_Connected) {
+        return INTERNET_STATE_OFFLINE;
+    }
+    return INTERNET_STATE_CONNECTED;
+}
+
+std::string offline_hint() {
+    if (query_internet_state() == INTERNET_STATE_OFFLINE) {
+        return " - no internet connection (check Wi-Fi / airplane mode)";
+    }
+    return std::string();
 }
 
 class net_connection {
@@ -142,30 +226,48 @@ public:
         hints.ai_socktype = SOCK_STREAM;
 
         struct addrinfo * results = nullptr;
-        if (getaddrinfo(u.host.c_str(), u.port.c_str(), &hints, &results) != 0 || !results) {
-            err = "getaddrinfo failed for " + u.host;
+        const int gai_rc = getaddrinfo(u.host.c_str(), u.port.c_str(), &hints, &results);
+        if (gai_rc != 0 || !results) {
+            err = "DNS lookup failed for " + u.host;
+            if (gai_rc != 0) {
+                err += std::string(" (") + gai_strerror(gai_rc) + ")";
+            }
+            err += offline_hint();
             return false;
         }
 
         bool connected = false;
+        int  last_errno = 0;
         for (struct addrinfo * it = results; it; it = it->ai_next) {
             sock_ = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
             if (sock_ < 0) {
+                last_errno = errno;
                 continue;
             }
             if (::connect(sock_, it->ai_addr, it->ai_addrlen) == 0) {
                 connected = true;
                 break;
             }
+            last_errno = errno;
             ::close(sock_);
             sock_ = -1;
         }
         freeaddrinfo(results);
 
         if (!connected || sock_ < 0) {
-            err = "connect failed for " + u.host + ":" + u.port;
+            err = "cannot connect to " + u.host + ":" + u.port;
+            if (last_errno != 0) {
+                err += std::string(" (") + std::strerror(last_errno) + ")";
+            }
+            err += offline_hint();
             return false;
         }
+
+        // a stalled connection eventually fails instead of blocking forever
+        timeval tv {};
+        tv.tv_sec = 30;
+        (void) setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        (void) setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         if (!use_ssl_) {
             return true;
@@ -177,41 +279,48 @@ public:
 
         Result rc = sslCreateContext(&ssl_ctx_, SslVersion_Auto);
         if (R_FAILED(rc)) {
-            err = "sslCreateContext failed: " + rc_to_hex(rc);
+            err = "TLS: sslCreateContext failed (rc " + rc_to_hex(rc) + ")";
             return false;
         }
         ssl_ctx_open_ = true;
 
         rc = sslContextCreateConnection(&ssl_ctx_, &ssl_conn_);
         if (R_FAILED(rc)) {
-            err = "sslContextCreateConnection failed: " + rc_to_hex(rc);
+            err = "TLS: sslContextCreateConnection failed (rc " + rc_to_hex(rc) + ")";
             return false;
         }
         ssl_conn_open_ = true;
 
         (void) sslConnectionSetOption(&ssl_conn_, SslOptionType_DoNotCloseSocket, true);
 
-        int out_fd = socketSslConnectionSetSocketDescriptor(&ssl_conn_, sock_);
-        if (out_fd < 0 && errno != ENOENT) {
-            err = "sslConnectionSetSocketDescriptor failed";
+        // with DoNotCloseSocket no new fd is returned; if one is, close_all() closes it
+        ssl_fd_ = socketSslConnectionSetSocketDescriptor(&ssl_conn_, sock_);
+        if (ssl_fd_ < 0 && errno != ENOENT) {
+            err = "TLS: sslConnectionSetSocketDescriptor failed";
             return false;
         }
 
         rc = sslConnectionSetHostName(&ssl_conn_, u.host.c_str(), (u32) u.host.size());
         if (R_FAILED(rc)) {
-            err = "sslConnectionSetHostName failed: " + rc_to_hex(rc);
+            err = "TLS: sslConnectionSetHostName failed (rc " + rc_to_hex(rc) + ")";
             return false;
         }
 
         rc = sslConnectionSetVerifyOption(&ssl_conn_, SslVerifyOption_PeerCa | SslVerifyOption_HostName);
         if (R_FAILED(rc)) {
-            err = "sslConnectionSetVerifyOption failed: " + rc_to_hex(rc);
+            err = "TLS: sslConnectionSetVerifyOption failed (rc " + rc_to_hex(rc) + ")";
             return false;
         }
 
         rc = sslConnectionDoHandshake(&ssl_conn_, nullptr, nullptr, nullptr, 0);
         if (R_FAILED(rc)) {
-            err = "ssl handshake failed: " + rc_to_hex(rc);
+            err = "TLS handshake with " + u.host + " failed (rc " + rc_to_hex(rc) + ")";
+            const Result cert_rc = sslConnectionGetVerifyCertError(&ssl_conn_);
+            if (R_FAILED(cert_rc)) {
+                err += ": certificate not accepted (rc " + rc_to_hex(cert_rc) + "), check the console date/time";
+            } else {
+                err += offline_hint();
+            }
             return false;
         }
 
@@ -222,15 +331,15 @@ public:
         size_t off = 0;
         while (off < len) {
             if (use_ssl_) {
-                const u32 chunk = (u32) std::min<size_t>(len - off, 0x8000);
+                const u32 chunk = (u32) std::min<size_t>(len - off, k_ssl_io_max);
                 u32 sent = 0;
                 Result rc = sslConnectionWrite(&ssl_conn_, data + off, chunk, &sent);
                 if (R_FAILED(rc)) {
-                    err = "ssl write failed: " + rc_to_hex(rc);
+                    err = "TLS write failed (rc " + rc_to_hex(rc) + ")";
                     return false;
                 }
                 if (sent == 0) {
-                    err = "ssl write returned 0";
+                    err = "TLS write returned 0";
                     return false;
                 }
                 off += sent;
@@ -254,14 +363,49 @@ public:
         return true;
     }
 
+    // 1 = data (or EOF) can be read without blocking, 0 = nothing arrived within timeout_ms.
+    // When polling is not available the result is always 1 and read_some() blocks instead
+    // (bounded by SO_RCVTIMEO). While data streams in (the last read filled a whole TLS record
+    // or the read buffer) the poll IPC is skipped.
+    int wait_readable(int timeout_ms) {
+        if (!poll_ok_ || streaming_) {
+            return 1;
+        }
+        if (use_ssl_) {
+            s32 pending = 0;
+            if (R_SUCCEEDED(sslConnectionPending(&ssl_conn_, &pending)) && pending > 0) {
+                return 1;
+            }
+            u32 events = 0;
+            if (R_FAILED(sslConnectionPoll(&ssl_conn_, SslPollEvent_Read, &events, (u32) timeout_ms))) {
+                poll_ok_ = false;
+                return 1;
+            }
+            return events != 0 ? 1 : 0;
+        }
+        pollfd pfd {};
+        pfd.fd     = sock_;
+        pfd.events = POLLIN;
+        const int rc = ::poll(&pfd, 1, timeout_ms);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                return 0;
+            }
+            poll_ok_ = false;
+            return 1;
+        }
+        return rc > 0 ? 1 : 0;
+    }
+
     ssize_t read_some(char * out, size_t size, std::string & err) {
         if (use_ssl_) {
             u32 read_size = 0;
-            Result rc = sslConnectionRead(&ssl_conn_, out, (u32) std::min<size_t>(size, 0x8000), &read_size);
+            Result rc = sslConnectionRead(&ssl_conn_, out, (u32) std::min<size_t>(size, k_ssl_io_max), &read_size);
             if (R_FAILED(rc)) {
-                err = "ssl read failed: " + rc_to_hex(rc);
+                err = "connection lost (TLS read rc " + rc_to_hex(rc) + ")";
                 return -1;
             }
+            streaming_ = read_size >= k_tls_record_max;
             return (ssize_t) read_size;
         }
 
@@ -271,8 +415,9 @@ public:
                 continue;
             }
             if (n < 0) {
-                err = std::string("recv failed: ") + std::strerror(errno);
+                err = std::string("connection lost (") + std::strerror(errno) + ")";
             }
+            streaming_ = n > 0 && (size_t) n == size;
             return n;
         }
     }
@@ -286,6 +431,10 @@ public:
             sslContextClose(&ssl_ctx_);
             ssl_ctx_open_ = false;
         }
+        if (ssl_fd_ >= 0) {
+            ::close(ssl_fd_);
+            ssl_fd_ = -1;
+        }
         if (sock_ >= 0) {
             ::close(sock_);
             sock_ = -1;
@@ -298,199 +447,380 @@ public:
 
 private:
     int sock_ = -1;
+    int ssl_fd_ = -1;
     bool use_ssl_ = false;
+    bool poll_ok_ = true;
+    bool streaming_ = false;
     bool ssl_ctx_open_ = false;
     bool ssl_conn_open_ = false;
     SslContext ssl_ctx_ {};
     SslConnection ssl_conn_ {};
 };
 
-bool parse_http_headers(
-    const std::string & headers_raw,
-    int & status_code,
-    std::map<std::string, std::string> & headers) {
-    std::istringstream stream(headers_raw);
-    std::string line;
+std::string write_error(uint64_t file_pos, int e) {
+    std::string msg = std::string("SD card write failed: ") + std::strerror(e);
+    if (e == ENOSPC) {
+        msg = "SD card is full";
+    }
+    if (file_pos >= 0xFFFFFFFFull) {
+        msg += " (FAT32 SD cards can't hold files of 4 GB or more; use exFAT)";
+    }
+    return msg;
+}
 
-    if (!std::getline(stream, line)) {
+enum transfer_result {
+    TRANSFER_RESULT_OK,
+    TRANSFER_RESULT_FAILED,
+    TRANSFER_RESULT_CANCELLED,
+    TRANSFER_RESULT_RETRY_FULL, // delete the .part and download the whole file again
+};
+
+// Reads the last byte of the .part file (the overlap byte of the resume request).
+bool read_last_byte(const std::string & path, uint64_t size, unsigned char & out) {
+    FILE * fp = std::fopen(path.c_str(), "rb");
+    if (!fp) {
         return false;
     }
-    if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-    }
-
-    status_code = 0;
-    std::sscanf(line.c_str(), "HTTP/%*s %d", &status_code);
-    if (status_code == 0) {
+    bool ok = std::fseek(fp, (long) (size - 1), SEEK_SET) == 0;
+    int ch = ok ? std::fgetc(fp) : EOF;
+    std::fclose(fp);
+    if (ch == EOF) {
         return false;
     }
-
-    while (std::getline(stream, line)) {
-        if (line == "\r" || line.empty()) {
-            break;
-        }
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-        std::string key = to_lower_ascii(trim(line.substr(0, colon)));
-        std::string value = trim(line.substr(colon + 1));
-        headers[key] = value;
-    }
-
+    out = (unsigned char) ch;
     return true;
 }
 
-} // namespace
-
-bool download_file(
-    const std::string & input_url,
-    const std::string & destination,
+transfer_result download_transfer(
+    const std::string & start_url,
+    const std::string & part_path,
+    uint64_t part_size,
     std::string & err,
     const download_progress_cb & progress_cb) {
-    std::string current_url = normalize_hf_url(input_url);
+    download_progress prog;
+    prog.received     = part_size;
+    prog.resumed_from = part_size;
+    prog.connecting   = true;
 
-    for (int redirect_count = 0; redirect_count < 6; ++redirect_count) {
+    bool cancelled = false;
+    auto report = [&]() {
+        if (progress_cb && !progress_cb(prog)) {
+            err       = "download cancelled";
+            cancelled = true;
+            return false;
+        }
+        return true;
+    };
+    auto fail = [&]() {
+        return cancelled ? TRANSFER_RESULT_CANCELLED : TRANSFER_RESULT_FAILED;
+    };
+
+    unsigned char last_byte = 0;
+    if (part_size > 0 && !read_last_byte(part_path, part_size, last_byte)) {
+        return TRANSFER_RESULT_RETRY_FULL;
+    }
+
+    // one buffer for headers and body; the body is decoded in place when chunked
+    char * io_buf = (char *) std::malloc(k_read_buf_size);
+    if (!io_buf) {
+        err = "out of memory (read buffer)";
+        return TRANSFER_RESULT_FAILED;
+    }
+    struct buf_guard {
+        char * p;
+        ~buf_guard() { std::free(p); }
+    } io_guard { io_buf };
+
+    std::string current_url = start_url;
+    for (int redirect_count = 0; redirect_count <= k_max_redirects; ++redirect_count) {
         parsed_url u;
         if (!parse_url(current_url, u, err)) {
-            return false;
+            return TRANSFER_RESULT_FAILED;
+        }
+
+        if (!report()) {
+            return fail();
         }
 
         net_connection conn;
         if (!conn.connect_to(u, err)) {
-            return false;
+            return TRANSFER_RESULT_FAILED;
         }
 
-        std::string request =
+        // the Range header is sent again on every redirect hop (HF redirects to its CDN)
+        const std::string request =
             "GET " + u.path + " HTTP/1.1\r\n"
             "Host: " + url_authority(u) + "\r\n"
-            "User-Agent: llama-switch-menu/1.0\r\n"
+            "User-Agent: llama-switch/1.0\r\n"
             "Accept: */*\r\n"
+            "Accept-Encoding: identity\r\n" +
+            download_range_header(part_size) +
             "Connection: close\r\n\r\n";
 
         if (!conn.write_all(request.c_str(), request.size(), err)) {
-            return false;
+            return TRANSFER_RESULT_FAILED;
         }
 
-        std::array<char, 8192> io_buf {};
-        std::string response_prefix;
-        size_t header_end = std::string::npos;
-
-        while (header_end == std::string::npos) {
-            ssize_t n = conn.read_some(io_buf.data(), io_buf.size(), err);
-            if (n < 0) {
-                return false;
+        // waits for data; keeps calling the progress callback (so B still cancels) while stalled
+        // (the stall time is measured on the clock in case a poll returns before its timeout)
+        auto read_next = [&](ssize_t & n) {
+            uint64_t stall_start = 0;
+            for (;;) {
+                const uint64_t t_poll = now_us();
+                if (conn.wait_readable(k_poll_ms) > 0) {
+                    break;
+                }
+                const uint64_t t = now_us();
+                if (t - t_poll < 10000) {
+                    svcSleepThread(10 * 1000 * 1000ULL); // don't spin if the poll returned early
+                }
+                if (stall_start == 0) {
+                    stall_start = t_poll;
+                }
+                const uint64_t stall_us = t - stall_start;
+                if (stall_us >= (uint64_t) k_stall_limit_ms * 1000) {
+                    err = "connection stalled (no data for 60 s)" + offline_hint();
+                    return false;
+                }
+                if (stall_us >= 2000000) {
+                    prog.speed_bps = 0.0;
+                    prog.eta_s     = -1.0;
+                }
+                if (!report()) {
+                    return false;
+                }
             }
-            if (n == 0) {
-                err = "connection closed before headers";
-                return false;
-            }
-            response_prefix.append(io_buf.data(), (size_t) n);
-            header_end = response_prefix.find("\r\n\r\n");
-            if (response_prefix.size() > 1024 * 1024) {
-                err = "response headers too large";
-                return false;
-            }
-        }
-
-        const std::string raw_headers = response_prefix.substr(0, header_end + 2);
-        int status_code = 0;
-        std::map<std::string, std::string> headers;
-        if (!parse_http_headers(raw_headers, status_code, headers)) {
-            err = "failed to parse response headers";
-            return false;
-        }
-
-        if (status_code >= 300 && status_code < 400) {
-            auto it = headers.find("location");
-            if (it == headers.end()) {
-                err = "redirect without location header";
-                return false;
-            }
-            current_url = resolve_redirect_url(u, it->second);
-            continue;
-        }
-
-        if (status_code != 200) {
-            err = "HTTP error " + std::to_string(status_code);
-            return false;
-        }
-
-        const auto te_it = headers.find("transfer-encoding");
-        if (te_it != headers.end() && to_lower_ascii(te_it->second).find("chunked") != std::string::npos) {
-            err = "chunked transfer encoding is not supported in this Switch build";
-            return false;
-        }
-
-        size_t content_length = 0;
-        const auto cl_it = headers.find("content-length");
-        if (cl_it != headers.end()) {
-            content_length = (size_t) std::strtoull(cl_it->second.c_str(), nullptr, 10);
-        }
-
-        ensure_parent_dir(destination);
-        FILE * fp = std::fopen(destination.c_str(), "wb");
-        if (!fp) {
-            err = std::string("failed to open output file: ") + std::strerror(errno);
-            return false;
-        }
-
-        auto close_and_fail = [&](const std::string & e) {
-            std::fclose(fp);
-            std::remove(destination.c_str());
-            err = e;
-            return false;
+            n = conn.read_some(io_buf, k_read_buf_size, err);
+            return n >= 0;
         };
 
-        size_t received = 0;
-        const size_t body_offset = header_end + 4;
-        if (response_prefix.size() > body_offset) {
-            const size_t body_bytes = response_prefix.size() - body_offset;
-            if (std::fwrite(response_prefix.data() + body_offset, 1, body_bytes, fp) != body_bytes) {
-                return close_and_fail(std::string("file write failed: ") + std::strerror(errno));
+        std::string response_prefix;
+        size_t header_end = std::string::npos;
+        while (header_end == std::string::npos) {
+            ssize_t n = 0;
+            if (!read_next(n)) {
+                return fail();
             }
-            received += body_bytes;
-            if (progress_cb && !progress_cb(received, content_length)) {
-                return close_and_fail("download cancelled");
+            if (n == 0) {
+                err = "connection closed before the response headers";
+                return TRANSFER_RESULT_FAILED;
+            }
+            response_prefix.append(io_buf, (size_t) n);
+            header_end = response_prefix.find("\r\n\r\n");
+            if (header_end == std::string::npos && response_prefix.size() > 64 * 1024) {
+                err = "response headers too large";
+                return TRANSFER_RESULT_FAILED;
             }
         }
 
-        while (content_length == 0 || received < content_length) {
-            ssize_t n = conn.read_some(io_buf.data(), io_buf.size(), err);
-            if (n < 0) {
-                std::fclose(fp);
-                std::remove(destination.c_str());
+        int status_code = 0;
+        std::string reason;
+        std::map<std::string, std::string> headers;
+        if (!http_parse_headers(response_prefix.substr(0, header_end + 2), status_code, reason, headers)) {
+            err = "invalid HTTP response from " + u.host;
+            return TRANSFER_RESULT_FAILED;
+        }
+
+        const download_plan plan = download_plan_response(status_code, reason, headers, part_size);
+        switch (plan.action) {
+            case DOWNLOAD_ACTION_REDIRECT:
+                current_url = resolve_redirect_url(u, plan.location);
+                continue;
+            case DOWNLOAD_ACTION_ERROR:
+                err = plan.err;
+                return TRANSFER_RESULT_FAILED;
+            case DOWNLOAD_ACTION_RETRY_FULL:
+                return TRANSFER_RESULT_RETRY_FULL;
+            case DOWNLOAD_ACTION_COMPLETE:
+                prog.total      = plan.total;
+                prog.connecting = false;
+                (void) report();
+                return TRANSFER_RESULT_OK;
+            case DOWNLOAD_ACTION_RESTART:
+            case DOWNLOAD_ACTION_APPEND:
+                break;
+        }
+
+        const bool append = plan.action == DOWNLOAD_ACTION_APPEND;
+        if (!append) {
+            prog.resumed_from = 0;
+        }
+        prog.received   = append ? part_size : 0;
+        prog.total      = plan.total;
+        prog.connecting = false;
+
+        if (plan.has_body_end && plan.body_end > prog.received) {
+            uint64_t free_bytes = 0;
+            if (download_free_space(part_path, free_bytes)) {
+                const uint64_t need      = plan.body_end - prog.received;
+                const uint64_t available = free_bytes + (append ? 0 : part_size); // restart truncates the .part
+                if (need + k_free_margin > available) {
+                    err = "not enough space on the SD card: need " + dl_fmt_size(need + k_free_margin) +
+                          ", free " + dl_fmt_size(available);
+                    return TRANSFER_RESULT_FAILED;
+                }
+            }
+        }
+
+        FILE * fp = std::fopen(part_path.c_str(), append ? "ab" : "wb");
+        if (!fp) {
+            err = std::string("cannot open ") + part_path + ": " + std::strerror(errno);
+            return TRANSFER_RESULT_FAILED;
+        }
+        char * write_buf = (char *) std::malloc(k_write_buf_size);
+        if (write_buf) {
+            std::setvbuf(fp, write_buf, _IOFBF, k_write_buf_size);
+        }
+        auto close_part = [&]() {
+            const bool ok = std::fclose(fp) == 0;
+            const int  e  = errno;
+            std::free(write_buf);
+            errno = e;
+            return ok;
+        };
+
+        dl_chunked chunked;
+        dl_speed   speed;
+        uint64_t   body_pos = plan.body_start; // file offset of the next body byte
+        dl_speed_update(speed, now_us(), 0);
+
+        // writes n body bytes; returns false on error (err set) or on a changed remote file
+        bool changed = false;
+        auto consume = [&](char * data, size_t n) {
+            if (plan.chunked) {
+                n = dl_chunked_feed(chunked, data, n, data);
+                if (chunked.error) {
+                    err = "invalid chunked encoding from server";
+                    return false;
+                }
+            }
+            if (plan.has_body_end && body_pos + n > plan.body_end) {
+                n = (size_t) (plan.body_end - body_pos); // ignore anything past the announced size
+            }
+            // the overlap byte of a resume request must match what is already on disk
+            if (append && n > 0 && body_pos < part_size) {
+                if ((unsigned char) data[0] != last_byte) {
+                    changed = true;
+                    return false;
+                }
+                data++;
+                n--;
+                body_pos++;
+            }
+            if (n > 0 && std::fwrite(data, 1, n, fp) != n) {
+                err = write_error(std::max<uint64_t>(plan.total, body_pos + n), errno);
                 return false;
+            }
+            body_pos     += n;
+            prog.received = body_pos;
+
+            dl_speed_update(speed, now_us(), prog.received - prog.resumed_from);
+            prog.speed_bps = speed.bps;
+            prog.eta_s     = dl_eta_seconds(prog.received, prog.total, speed.bps);
+            // called for every chunk so B cancels quickly; the caller throttles redrawing
+            return report();
+        };
+
+        auto body_done = [&]() {
+            if (plan.chunked) {
+                return chunked.done;
+            }
+            return plan.has_body_end && body_pos >= plan.body_end;
+        };
+
+        bool ok = true;
+        const size_t body_offset = header_end + 4;
+        if (response_prefix.size() > body_offset) {
+            ok = consume(&response_prefix[body_offset], response_prefix.size() - body_offset);
+        } else {
+            ok = report();
+        }
+        response_prefix.clear();
+        response_prefix.shrink_to_fit();
+
+        // without a size (and not chunked) the end of the connection is the end of the file
+        while (ok && !body_done()) {
+            ssize_t n = 0;
+            if (!read_next(n)) {
+                ok = false;
+                break;
             }
             if (n == 0) {
                 break;
             }
-            const size_t n_bytes = (size_t) n;
-            if (std::fwrite(io_buf.data(), 1, n_bytes, fp) != n_bytes) {
-                return close_and_fail(std::string("file write failed: ") + std::strerror(errno));
-            }
-            received += n_bytes;
-            if (progress_cb && !progress_cb(received, content_length)) {
-                return close_and_fail("download cancelled");
-            }
+            ok = consume(io_buf, (size_t) n);
         }
 
-        std::fclose(fp);
-
-        if (content_length > 0 && received != content_length) {
-            std::remove(destination.c_str());
-            err = "download incomplete (" + std::to_string(received) + "/" + std::to_string(content_length) + ")";
-            return false;
+        const bool closed = close_part();
+        if (changed) {
+            return TRANSFER_RESULT_RETRY_FULL;
+        }
+        if (!ok) {
+            return fail();
+        }
+        if (!closed) {
+            err = write_error(std::max<uint64_t>(plan.total, body_pos), errno);
+            return TRANSFER_RESULT_FAILED;
         }
 
-        return true;
+        const std::string resume_hint = " - start the download again to resume";
+        if (plan.chunked && !chunked.done) {
+            err = "connection closed early (" + dl_fmt_size(body_pos) + " received)" + resume_hint;
+            return TRANSFER_RESULT_FAILED;
+        }
+        if (plan.has_body_end && body_pos != plan.body_end) {
+            err = "connection closed early (" + dl_fmt_size(body_pos) + " of " +
+                  dl_fmt_size(plan.total > 0 ? plan.total : plan.body_end) + ")" + resume_hint;
+            return TRANSFER_RESULT_FAILED;
+        }
+        return TRANSFER_RESULT_OK;
     }
 
     err = "too many redirects";
-    return false;
+    return TRANSFER_RESULT_FAILED;
+}
+
+} // namespace
+
+download_result download_file(
+    const std::string & input_url,
+    const std::string & destination,
+    std::string & err,
+    const download_progress_cb & progress_cb) {
+    const std::string url       = normalize_hf_url(input_url);
+    const std::string part_path = download_part_path(destination);
+
+    // everything below writes only to part_path; destination is touched by download_finalize_part()
+    ensure_parent_dir(destination);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uint64_t part_size = 0;
+        if (!stat_file_size(part_path, part_size)) {
+            part_size = 0;
+        }
+
+        const transfer_result res = download_transfer(url, part_path, part_size, err, progress_cb);
+        if (res == TRANSFER_RESULT_CANCELLED) {
+            return DOWNLOAD_RESULT_CANCELLED;
+        }
+        if (res == TRANSFER_RESULT_FAILED) {
+            return DOWNLOAD_RESULT_FAILED;
+        }
+        if (res == TRANSFER_RESULT_RETRY_FULL) {
+            // the partial file doesn't match the remote file (or can't be resumed): start over
+            std::remove(part_path.c_str());
+            if (attempt == 0 && part_size > 0) {
+                continue;
+            }
+            err = "server sent an unexpected range; download could not be resumed";
+            return DOWNLOAD_RESULT_FAILED;
+        }
+
+        return download_finalize_part(part_path, destination, err) ? DOWNLOAD_RESULT_OK : DOWNLOAD_RESULT_FAILED;
+    }
+
+    err = "download could not be resumed";
+    return DOWNLOAD_RESULT_FAILED;
 }
 
 void download_exit() {

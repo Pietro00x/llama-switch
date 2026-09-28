@@ -33,10 +33,23 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     fi
 fi
 
+# CPU code generation for the Tegra X1 (Cortex-A57, ARMv8.0-A):
+#   - GGML_CPU_ARM_ARCH pins ggml-cpu to ARMv8.0 + NEON (+crc/crypto, same as the devkitA64 defaults).
+#     The A57 has no dotprod, i8mm, fp16 vector arithmetic, SVE or LSE atomics - code using any of them
+#     dies with an illegal instruction, so never raise this to armv8.2-a or later.
+#   - devkitPro's Release flags are "-g -O2"; use -O3 like a regular upstream build (the -g only lives
+#     in the .elf, the .nro is not affected). Costs ~350 KB of .nro size.
+#   - GGML_LTO=ON also builds and links with devkitA64 (slightly smaller .nro) but is left off: the hot
+#     ggml-cpu kernels are reached through function pointer tables, so there is little to inline, and the
+#     speed-up is unverified on hardware. Try it with: scripts/build-switch.sh -DGGML_LTO=ON
+# Options passed on the command line come last and override these.
 "$SWITCH_CMAKE" -S "$ROOT" -B "$BUILD_DIR" "${GEN_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS_RELEASE="-g -O3 -DNDEBUG" \
+    -DCMAKE_CXX_FLAGS_RELEASE="-g -O3 -DNDEBUG" \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_NATIVE=OFF \
+    -DGGML_CPU_ARM_ARCH=armv8-a+crc+crypto \
     -DGGML_OPENMP=OFF \
     -DGGML_BACKEND_DL=OFF \
     -DGGML_CCACHE=OFF \

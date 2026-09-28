@@ -43,8 +43,15 @@ struct app_state {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     llama_sampler * sampler = nullptr;
+    ggml_threadpool * threadpool = nullptr; // owned by engine.cpp, attached to ctx
     std::string loaded_model_path;
     std::vector<chat_turn> chat_turns;
+
+    // engine settings of the loaded model, filled by load_model (reset by unload_model)
+    double   load_ms   = 0.0;   // wall time of the last successful load_model
+    int      n_threads = 0;     // CPU threads used for prompt and generation
+    uint32_t n_ubatch  = 0;     // physical batch size used for prompt processing
+    bool     cpu_boost = false; // CPU boost mode is active (Switch only)
 
     uint64_t process_total = 0;
     uint64_t process_used = 0;

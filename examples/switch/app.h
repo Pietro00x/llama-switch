@@ -37,6 +37,7 @@ struct model_entry {
 struct chat_turn {
     std::string user;
     std::string assistant;
+    bool stopped = false; // display only: the reply was cancelled by the user
 };
 
 // Snapshot of the part of the memory that cannot be rolled back (recurrent state of recurrent/hybrid models).

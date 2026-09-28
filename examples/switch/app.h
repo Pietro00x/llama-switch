@@ -29,6 +29,7 @@ struct model_entry {
 struct chat_turn {
     std::string user;
     std::string assistant;
+    bool stopped = false; // display only: the reply was cancelled by the user
 };
 
 struct app_state {

@@ -24,6 +24,14 @@ struct model_entry {
     int   default_top_k = 40;
     std::string system_prompt; // optional; empty = none
     std::string chat_template; // optional override; empty = use the template stored in the GGUF
+
+    // Runtime-only fields (never written to models.json). File fields are refreshed by
+    // refresh_model_files() / load_model_list() in models.cpp, not every frame.
+    uint64_t    file_size    = 0;     // bytes; 0 when the file is not on the SD card
+    bool        on_sd        = false; // a regular file exists at `path`
+    std::string arch         = "";    // GGUF general.architecture; empty if unknown
+    bool        from_scan    = false; // found in the models dir but not listed in models.json
+    bool        from_catalog = false; // built-in catalog entry that models.json does not list
 };
 
 struct chat_turn {

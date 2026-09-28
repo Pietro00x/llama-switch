@@ -13,6 +13,9 @@ llama_add_compile_flags()
 # examples
 
 if (EMSCRIPTEN)
+elseif (NINTENDO_SWITCH)
+    # Nintendo Switch homebrew app (devkitPro toolchain), see scripts/build-switch.sh
+    add_subdirectory(switch)
 else()
     add_subdirectory(batched)
     add_subdirectory(debug)

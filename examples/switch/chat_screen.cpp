@@ -574,10 +574,17 @@ static void render_chat(const app_state & state, const chat_view & v) {
 static std::string chat_fmt_live(const gen_stats & st) {
     char buf[128];
     if (st.n_gen <= 0) {
-        std::snprintf(buf, sizeof(buf), "Processing prompt...");
+        const int n_todo = st.n_prompt_total - st.n_cached;
+        if (n_todo > 0) {
+            std::snprintf(buf, sizeof(buf), "Processing prompt... %d/%d tok (%d reused)",
+                st.n_prompt, n_todo, st.n_cached);
+        } else {
+            std::snprintf(buf, sizeof(buf), "Processing prompt...");
+        }
     } else {
         const double tps = st.gen_ms > 0.0 ? 1000.0 * st.n_gen / st.gen_ms : 0.0;
-        std::snprintf(buf, sizeof(buf), "Generating... %d tok  %.1f tok/s", st.n_gen, tps);
+        std::snprintf(buf, sizeof(buf), "%s %d tok  %.1f tok/s", st.thinking ? "Thinking..." : "Generating...",
+            st.n_gen, tps);
     }
     return buf;
 }
@@ -628,7 +635,7 @@ static void chat_send(app_state & state, PadState & pad, chat_view & v) {
         assistant,
         [&](const std::string & text, const gen_stats & st) {
             ++n_callback;
-            if (!appletMainLoop()) {
+            if (!ui_app_running()) {
                 state.quit = true;
                 return false;
             }
@@ -711,7 +718,7 @@ void run_chat_screen(app_state & state, PadState & pad) {
     uint64_t    last_draw = 0;
 
     while (true) {
-        if (!appletMainLoop()) {
+        if (!ui_app_running()) {
             state.quit = true;
             break;
         }

@@ -1,6 +1,5 @@
 #include "download.h"
 #include "engine.h"
-#include "catalog.h"
 #include "models.h"
 #include "screens.h"
 #include "sysinfo.h"
@@ -21,14 +20,18 @@ int main(int argc, char ** argv) {
     PadState pad;
     padInitializeDefault(&pad);
 
+    // before llama_backend_init so backend init logs also go to the log file, not the console
+    engine_log_init();
     llama_backend_init();
     ggml_backend_load_all();
 
     app_state state;
     std::string err;
     if (!load_model_list(k_model_list_path, state.models, err)) {
-        state.models = default_models();
+        state.models = fallback_model_list();
         state.status = "Using fallback model list: " + err;
+    } else if (!err.empty()) {
+        state.status = "Loaded " + std::to_string(state.models.size()) + " models (warning: " + err + ")";
     } else {
         state.status = "Loaded " + std::to_string(state.models.size()) + " models from models.json";
     }

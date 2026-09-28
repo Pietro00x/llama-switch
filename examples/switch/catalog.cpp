@@ -76,9 +76,9 @@
 // "/no_think" is the documented Qwen3/SmolLM3 system-prompt switch that skips the <think> phase.
 // On an A57 that phase can cost hundreds of tokens (minutes) before the first visible word.
 // The switch only holds across turns if earlier <think>...</think> blocks are dropped from the history,
-// which is what the official template does. Qwen3.5 has no /no_think switch. With the built-in chatml
-// template and these sampling settings, it answers without thinking (it emits an empty <think></think>),
-// but it can still start thinking at a higher temperature.
+// which is what the official template does. Qwen3.5 has no /no_think switch of its own, but generate.cpp
+// treats "/no_think" in the system prompt as "start the reply with an empty <think></think>" (what the
+// official Qwen templates do to disable thinking), so it is set for the Qwen3.5 entries too.
 
 static constexpr const char * k_models_dir = "sdmc:/switch/llama_cpp_switch/models/";
 
@@ -105,9 +105,9 @@ std::vector<model_entry> default_models() {
         make_entry("Gemma 3 1B IT Q4_K_M (806 MB)", "ggml-org/gemma-3-1b-it-GGUF",
                    "gemma-3-1b-it-Q4_K_M.gguf", 4096, 1.0f, 0.95f, 64, ""),
         make_entry("Qwen3.5 0.8B Q8_0 (812 MB)", "unsloth/Qwen3.5-0.8B-GGUF",
-                   "Qwen3.5-0.8B-Q8_0.gguf", 4096, 0.7f, 0.8f, 20, ""),
+                   "Qwen3.5-0.8B-Q8_0.gguf", 4096, 0.7f, 0.8f, 20, "/no_think"),
         make_entry("Qwen3.5 2B Q4_K_M (1.3 GB)", "unsloth/Qwen3.5-2B-GGUF",
-                   "Qwen3.5-2B-Q4_K_M.gguf", 4096, 0.7f, 0.8f, 20, ""),
+                   "Qwen3.5-2B-Q4_K_M.gguf", 4096, 0.7f, 0.8f, 20, "/no_think"),
         make_entry("Granite 4.0 H 1B Q4_K_M (901 MB)", "ibm-granite/granite-4.0-h-1b-GGUF",
                    "granite-4.0-h-1b-Q4_K_M.gguf", 4096, 0.3f, 0.95f, 40, ""),
         make_entry("Qwen3 0.6B Q8_0 (639 MB)", "Qwen/Qwen3-0.6B-GGUF",

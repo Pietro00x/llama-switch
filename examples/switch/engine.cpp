@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "generate.h"
 
 #include "ggml-cpu.h"
 
@@ -39,6 +40,8 @@ static constexpr int      k_switch_max_threads = 3;
 static constexpr uint32_t k_n_ubatch_min       = 64;
 static constexpr uint32_t k_n_ubatch_max       = 256;
 static constexpr uint64_t k_logits_budget      = 64ull * 1024 * 1024;
+// prompt tokens per llama_decode call during prefill (generate.cpp checks for B between calls)
+static constexpr uint32_t k_n_batch_prefill    = 256;
 
 //
 // logging
@@ -232,8 +235,32 @@ static uint32_t engine_pick_n_ubatch(const llama_model * model, uint32_t n_ctx) 
 // model lifecycle
 //
 
+bool engine_rebuild_sampler(app_state & state, std::string & err) {
+    auto sparams = llama_sampler_chain_default_params();
+    sparams.no_perf = false;
+
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
+    if (!smpl) {
+        err = "failed to create sampler chain";
+        return false;
+    }
+
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(clamp_top_k(state.top_k)));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(clamp_top_p(state.top_p), 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(clamp_temp(state.temperature)));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    if (state.sampler) {
+        llama_sampler_free(state.sampler);
+    }
+    state.sampler = smpl;
+    return true;
+}
+
 // frees everything but keeps the CPU boost state (load_model reuses it when switching models)
 static void engine_free(app_state & state) {
+    // drops the KV bookkeeping and state snapshots (up to 128 MB) that refer to the context
+    generate_reset_cache(state);
     if (state.sampler) {
         llama_sampler_free(state.sampler);
         state.sampler = nullptr;
@@ -311,9 +338,10 @@ bool load_model(app_state & state, std::string & err) {
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx           = (uint32_t) n_ctx;
-    // the prompt is decoded with a single llama_decode call and may use up to the whole context,
-    // which must not exceed n_batch; the compute buffer size only depends on n_ubatch
-    ctx_params.n_batch         = (uint32_t) n_ctx;
+    // generate.cpp decodes the prompt in chunks of n_batch tokens and calls the UI between chunks, so
+    // n_batch sets how quickly B can stop a long prefill; the compute buffer size only depends on n_ubatch.
+    // Encoder models need the whole input in one batch (n_ubatch == n_ctx for them, see above).
+    ctx_params.n_batch         = std::min((uint32_t) n_ctx, std::max(n_ubatch, k_n_batch_prefill));
     ctx_params.n_ubatch        = n_ubatch;
     ctx_params.n_threads       = n_threads;
     ctx_params.n_threads_batch = n_threads;
@@ -331,20 +359,10 @@ bool load_model(app_state & state, std::string & err) {
     state.threadpool = ggml_threadpool_new(&tp_params);
     llama_attach_threadpool(state.ctx, state.threadpool, nullptr);
 
-    auto sparams = llama_sampler_chain_default_params();
-    sparams.no_perf = false;
-
-    state.sampler = llama_sampler_chain_init(sparams);
-    if (!state.sampler) {
+    if (!engine_rebuild_sampler(state, err)) {
         unload_model(state);
-        err = "failed to create sampler chain";
         return false;
     }
-
-    llama_sampler_chain_add(state.sampler, llama_sampler_init_top_k(clamp_top_k(state.top_k)));
-    llama_sampler_chain_add(state.sampler, llama_sampler_init_top_p(clamp_top_p(state.top_p), 1));
-    llama_sampler_chain_add(state.sampler, llama_sampler_init_temp(clamp_temp(state.temperature)));
-    llama_sampler_chain_add(state.sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     state.loaded_model_path = selected.path;
     state.load_ms   = (double) (ggml_time_us() - t_start_us) / 1000.0;

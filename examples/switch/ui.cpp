@@ -162,6 +162,15 @@ std::string ui_progress_bar(double frac, int width) {
     return "[" + std::string((size_t) filled, '#') + std::string((size_t) (inner - filled), '.') + "]";
 }
 
+static bool g_ui_exit_requested = false;
+
+bool ui_app_running() {
+    if (!g_ui_exit_requested && !appletMainLoop()) {
+        g_ui_exit_requested = true;
+    }
+    return !g_ui_exit_requested;
+}
+
 bool ui_confirm(PadState & pad, const std::string & question) {
     const int cols  = ui_cols();
     const int w     = std::min(cols - 4, std::max(40, (int) question.size() + 6));
@@ -180,7 +189,7 @@ bool ui_confirm(PadState & pad, const std::string & question) {
     std::printf(UI_FG_GREEN "(A) Yes" UI_RESET "   " UI_FG_RED "(B) No" UI_RESET);
     ui_frame_end();
 
-    while (appletMainLoop()) {
+    while (ui_app_running()) {
         padUpdate(&pad);
         const u64 k_down = padGetButtonsDown(&pad);
         if (k_down & HidNpadButton_A) {

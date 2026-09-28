@@ -588,11 +588,24 @@ static void adjust_selected_item(app_state & state, menu_view & view, int dir) {
         default:
             break;
     }
+
+    // sampling changes apply to the loaded model right away (the context needs a reload, the sampler does not)
+    if (state.sampler && (view.cursor == MENU_TEMP || view.cursor == MENU_TOP_P || view.cursor == MENU_TOP_K)) {
+        std::string err;
+        if (!engine_rebuild_sampler(state, err)) {
+            state.status = "Sampler update failed: " + err;
+        }
+    }
 }
 
 static void menu_do_download(app_state & state, menu_view & view, PadState & pad) {
+    const model_entry * sel = menu_selected(state);
+    if (sel && sel->url.empty()) {
+        state.status = "Local file only: this model has no download URL";
+        return;
+    }
     if (menu_selected_size(state, view) >= 0 &&
-        !ui_confirm(pad, "Download again? The file on SD is replaced; cancelling or a failed download deletes it.")) {
+        !ui_confirm(pad, "Download again? The file on SD is only replaced once the new copy is complete.")) {
         state.status = "Download cancelled";
         return;
     }
@@ -607,6 +620,10 @@ static void menu_do_load(app_state & state, menu_view & view, PadState & pad) {
         return;
     }
     if (menu_selected_size(state, view) < 0) {
+        if (sel->url.empty()) {
+            state.status = "Model file missing on SD (local entry, no download URL): " + sel->path;
+            return;
+        }
         if (ui_confirm(pad, "The model file is not on the SD card. Download it now?")) {
             run_download_screen(state, pad);
             menu_refresh_files(state, view);
@@ -676,14 +693,12 @@ static void run_action(app_state & state, menu_view & view, PadState & pad) {
             break;
 
         case MENU_RELOAD_JSON:
-            if (load_model_list(k_model_list_path, state.models, err)) {
-                if (state.models.empty()) {
-                    state.selected_model = 0;
-                } else {
-                    state.selected_model = std::min(state.selected_model, state.models.size() - 1);
-                    apply_selected_model_defaults(state);
+            // keeps the selection on the same model (by path): the list is re-sorted on every load
+            if (reload_model_list(state, err)) {
+                state.status = "Reloaded model list (" + menu_fmt_int((int) state.models.size()) + " models)";
+                if (!err.empty()) {
+                    state.status += " - warning: " + err;
                 }
-                state.status = "Reloaded model list from JSON (" + menu_fmt_int((int) state.models.size()) + " models)";
             } else {
                 state.status = "Reload JSON failed: " + err;
             }
@@ -742,7 +757,7 @@ void run_main_menu(app_state & state, PadState & pad) {
     menu_refresh_files(state, view);
     update_stats(state);
 
-    while (appletMainLoop() && !state.quit) {
+    while (ui_app_running() && !state.quit) {
         const uint64_t t = now_us();
         if (t - view.last_stats_check_us >= k_stats_interval_us) {
             view.last_stats_check_us = t;

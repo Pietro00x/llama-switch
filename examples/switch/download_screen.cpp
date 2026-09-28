@@ -112,7 +112,7 @@ void show_result(app_state & state, PadState & pad, const download_view & v, boo
     ui_footer("A/B back");
     ui_frame_end();
 
-    while (appletMainLoop()) {
+    while (ui_app_running()) {
         padUpdate(&pad);
         if (padGetButtonsDown(&pad) & (HidNpadButton_A | HidNpadButton_B)) {
             return;
@@ -156,7 +156,7 @@ void run_download_screen(app_state & state, PadState & pad) {
         // honor HOME -> close / system exit requests during long transfers
         if (t - last_applet >= 100000) {
             last_applet = t;
-            if (!appletMainLoop()) {
+            if (!ui_app_running()) {
                 state.quit = true;
                 return false;
             }

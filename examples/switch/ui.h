@@ -67,5 +67,10 @@ std::string ui_progress_bar(double frac, int width);
 // pads or clips s to exactly width characters
 std::string ui_fit(const std::string & s, int width);
 
-// modal yes/no dialog drawn over the current screen: A = yes, B = no
+// modal yes/no dialog drawn over the current screen: A = yes, B = no (also no when the app is closing)
 bool ui_confirm(PadState & pad, const std::string & question);
+
+// appletMainLoop() that remembers an exit request: libnx reports it only once, so a nested loop (dialog,
+// download, generation) that consumed it would otherwise leave the outer loops running.
+// Use this instead of appletMainLoop() in every loop.
+bool ui_app_running();

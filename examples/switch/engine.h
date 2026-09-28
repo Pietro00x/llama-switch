@@ -8,6 +8,10 @@
 // On success also fills state.load_ms/n_threads/n_ubatch/cpu_boost.
 bool load_model(app_state & state, std::string & err);
 
+// (Re)creates state.sampler from state.top_k/top_p/temperature, e.g. after the menu changed them.
+// The old sampler is kept if creating the new one fails.
+bool engine_rebuild_sampler(app_state & state, std::string & err);
+
 // Frees sampler, context, thread pool and model. Safe to call when nothing is loaded.
 void unload_model(app_state & state);
 

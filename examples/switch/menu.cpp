@@ -668,7 +668,11 @@ static void adjust_selected_item(app_state & state, menu_view & view, PadState &
             }
             const size_t n = state.models.size();
             state.selected_model = (state.selected_model + n + (dir > 0 ? 1 : n - 1)) % n;
-            apply_selected_model_defaults(state);
+            // while a model is loaded the sampling rows show its live sampler: keep them, the newly selected
+            // model's defaults are applied when it is loaded (menu_do_load)
+            if (!state.model) {
+                apply_selected_model_defaults(state);
+            }
             state.status = "Selected model: " + state.models[state.selected_model].name;
         } break;
         case MENU_CONTEXT:
@@ -745,6 +749,11 @@ static void menu_do_load(app_state & state, menu_view & view, PadState & pad) {
             view.dirty = true;
             return;
         }
+    }
+
+    // switching to another model starts from its defaults; reloading the same one keeps the edited values
+    if (state.model && !menu_selected_is_loaded(state)) {
+        apply_selected_model_defaults(state);
     }
 
     const std::string name = sel->name;

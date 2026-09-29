@@ -773,6 +773,13 @@ transfer_result download_transfer(
                   dl_fmt_size(plan.total > 0 ? plan.total : plan.body_end) + ")" + resume_hint;
             return TRANSFER_RESULT_FAILED;
         }
+        // a 206 may legally cover only part of the rest of the file ("bytes a-b/total" with b + 1 < total):
+        // the range is complete, but the file is not - never hand such a .part to download_finalize_part()
+        if (plan.total > 0 && body_pos != plan.total) {
+            err = "download incomplete (" + dl_fmt_size(body_pos) + " of " + dl_fmt_size(plan.total) + ")" +
+                  resume_hint;
+            return TRANSFER_RESULT_FAILED;
+        }
         return TRANSFER_RESULT_OK;
     }
 

@@ -15,15 +15,17 @@
 // so a larger context costs them almost nothing. Plain transformers (Qwen3, SmolLM3) pay the full price.
 // Gemma 3 is iSWA, but llama.cpp allocates a full-size SWA cache by default, so all 26 layers count.
 //
-// The compute buffer is dominated by the logits of one micro-batch: n_ubatch (512) * n_vocab * 4 bytes.
-// That means models with a large vocabulary (Gemma 3: 262k, Qwen3.5: 248k) need ~0.5 GB of compute
-// buffer, even though their KV cache is small.
+// The compute buffer is dominated by the logits of one micro-batch: n_ubatch * n_vocab * 4 bytes.
+// engine.cpp picks n_ubatch per model (64..256) to keep that under 64 MiB, so the "compute" column below,
+// measured at n_ubatch 512, is the worst case: large-vocabulary models (Gemma 3: 262k, Qwen3.5: 248k)
+// actually use ~65 MiB instead of ~0.5 GB.
 //
 // Quant choice on the A57
 // -----------------------
 // ARMv8.0 has NEON but no dotprod, i8mm or fp16 arithmetic. As a result, none of the ggml-cpu repack
-// fast paths (Q4_0 4x4/4x8, Q4_K 8x4/8x8, Q8_0 4x4, IQ4_NL 4x4) are enabled, see repack.cpp. Every
-// quant goes through the generic NEON vec_dot with an emulated vdotq_s32 (vmull + vpadal).
+// fast paths (Q4_0 4x4/4x8, Q4_K 8x4/8x8, Q8_0 4x4, IQ4_NL 4x4) are enabled, see repack.cpp. This port
+// adds A57-specific kernels instead (int16 multiply-accumulate, no dotprod): a 4-row Q4_0/Q8_0 GEMV for
+// single-token decode (arch/arm/gemv-a57.c) and rewritten Q4_0/Q8_0/Q4_K/Q5_K/Q6_K vec_dots (arch/arm/quants.c).
 //   - Q4_0:   the cheapest 4-bit decode and the smallest file. Lower quality with plain post-training
 //             quantization, but LiquidAI ships a quantization-aware-distilled (QAD) Q4_0 build.
 //   - Q4_K_M: roughly 5% bigger than Q4_0 and a bit more unpacking work per block, with clearly

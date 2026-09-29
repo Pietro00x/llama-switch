@@ -13,15 +13,53 @@ int ui_rows() {
     return con && con->consoleHeight > 0 ? con->consoleHeight : 45;
 }
 
+// consoleInit() makes stdout unbuffered, so every printf is a separate write through the console devoptab.
+// A frame is buffered instead and handed to the console in a few large writes by ui_frame_end(). Nothing
+// is visible before consoleUpdate() anyway. Outside frames stdout goes back to unbuffered, so nothing
+// printed there can stay in the buffer and be written after consoleExit() (the renderer is gone by then).
+static char     g_ui_out_buf[16384];
+static bool     g_ui_out_buffered = false;
+static uint64_t g_ui_frames       = 0;
+
+static void ui_out_buffer_begin() {
+    if (!g_ui_out_buffered) {
+        std::setvbuf(stdout, g_ui_out_buf, _IOFBF, sizeof(g_ui_out_buf));
+        g_ui_out_buffered = true;
+    }
+}
+
+static void ui_out_buffer_end() {
+    std::fflush(stdout);
+    if (g_ui_out_buffered) {
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        g_ui_out_buffered = false;
+    }
+}
+
 void ui_frame_begin() {
     std::printf(UI_RESET);
+    // consoleClear() draws directly, not through stdout: anything still buffered has to come first,
+    // and the reset colors must already be applied (the clear draws spaces in the current colors)
+    std::fflush(stdout);
     consoleClear();
+    ui_out_buffer_begin();
+}
+
+void ui_frame_begin_overwrite() {
+    ui_out_buffer_begin();
+    std::printf(UI_RESET);
+    ui_move(0, 0);
 }
 
 void ui_frame_end() {
     std::printf(UI_RESET);
-    std::fflush(stdout);
+    ui_out_buffer_end();
     consoleUpdate(nullptr);
+    ++g_ui_frames;
+}
+
+uint64_t ui_frame_count() {
+    return g_ui_frames;
 }
 
 void ui_move(int row, int col) {
@@ -38,22 +76,29 @@ std::string ui_fit(const std::string & s, int width) {
     return s + std::string((size_t) width - s.size(), ' ');
 }
 
-void ui_title_bar(const std::string & title, const std::string & right) {
+std::string ui_title_bar_line(const std::string & title, const std::string & right) {
     const int cols = ui_cols();
     std::string line = " " + title;
     const int room = cols - (int) line.size() - 1;
     if (!right.empty() && room > (int) right.size()) {
         line += std::string((size_t) (room - (int) right.size()), ' ') + right;
     }
-    ui_move(0, 0);
     // the last column is left alone: writing it moves the cursor to the next line
-    std::printf(UI_REVERSE "%s" UI_RESET, ui_fit(line, cols - 1).c_str());
+    return UI_REVERSE + ui_fit(line, cols - 1) + UI_RESET;
+}
+
+std::string ui_footer_line(const std::string & hints) {
+    return UI_REVERSE + ui_fit(" " + hints, ui_cols() - 1) + UI_RESET;
+}
+
+void ui_title_bar(const std::string & title, const std::string & right) {
+    ui_move(0, 0);
+    std::fputs(ui_title_bar_line(title, right).c_str(), stdout);
 }
 
 void ui_footer(const std::string & hints) {
-    const int cols = ui_cols();
     ui_move(ui_rows() - 1, 0);
-    std::printf(UI_REVERSE "%s" UI_RESET, ui_fit(" " + hints, cols - 1).c_str());
+    std::fputs(ui_footer_line(hints).c_str(), stdout);
 }
 
 void ui_hline(int row, char ch) {
@@ -180,6 +225,7 @@ bool ui_confirm(PadState & pad, const std::string & question) {
 
     const std::vector<std::string> text = ui_wrap(question, w - 4);
 
+    ui_out_buffer_begin(); // drawn over the current screen, without ui_frame_begin()
     ui_box(row, col, h, w, "Confirm");
     for (size_t i = 0; i < text.size() && i < 2; ++i) {
         ui_move(row + 2 + (int) i, col + 2);

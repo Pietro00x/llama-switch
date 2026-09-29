@@ -5,6 +5,7 @@
 
 #include <switch.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -39,8 +40,19 @@ int ui_rows();
 
 // ui_frame_begin() clears the screen and homes the cursor; ui_frame_end() presents it (consoleUpdate).
 // Draw a whole frame between the two and only redraw when something changed.
+// stdout is fully buffered between the two and written out by ui_frame_end() right before
+// consoleUpdate(); outside a frame it stays unbuffered, as consoleInit() leaves it.
 void ui_frame_begin();
 void ui_frame_end();
+
+// Like ui_frame_begin() but without clearing (a clear alone draws all 80x45 cells): the console keeps
+// the previous frame, so the caller must rewrite every cell it drew before (pad rows with ui_fit, blank
+// unused rows) or stale text stays on screen. Use ui_frame_count() to find out whether anything else
+// drew in between (then call ui_frame_begin() instead).
+void ui_frame_begin_overwrite();
+
+// number of frames presented so far (incremented by every ui_frame_end(), also the one in ui_confirm())
+uint64_t ui_frame_count();
 
 // moves the cursor to a 0-based row/column
 void ui_move(int row, int col);
@@ -48,6 +60,10 @@ void ui_move(int row, int col);
 // full-width reverse-video bars: title on row 0 (right text right-aligned), hints on the last row
 void ui_title_bar(const std::string & title, const std::string & right);
 void ui_footer(const std::string & hints);
+
+// the same bars as printable strings (SGR escapes + ui_cols() - 1 characters), without moving the cursor
+std::string ui_title_bar_line(const std::string & title, const std::string & right);
+std::string ui_footer_line(const std::string & hints);
 
 // horizontal line across the screen at row
 void ui_hline(int row, char ch = '-');

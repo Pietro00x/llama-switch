@@ -16,5 +16,5 @@ std::string rc_to_hex(Result rc);
 // Refreshes process RAM usage and CPU/GPU/EMC clocks in state (at most every 250 ms).
 void update_stats(app_state & state);
 
-// Closes the clock services opened by update_stats.
+// Closes the clock sessions and services opened by update_stats (they stay open until then).
 void sysinfo_exit();

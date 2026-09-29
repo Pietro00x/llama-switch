@@ -2064,6 +2064,62 @@ static inline svuint32_t ggml_decode_q4scales_and_mins_for_mmla(const uint32_t *
 }
 #endif
 
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+// Q4_K/Q5_K helpers for AArch64 NEON without dotprod (e.g. Cortex-A57 in the Nintendo Switch).
+// The dotprod paths below keep using ggml_vdotq_s32 = vdotq_s32.
+// Nintendo Switch port patch (__SWITCH__ builds use this path): gated on the CPU features rather than
+// on __SWITCH__ so it can be tested on any A57/qemu target; not upstream, re-apply after scripts/sync-ggml.sh.
+
+// Unpacks the 12 packed 6-bit scales/mins of a Q4_K/Q5_K superblock (all in [0, 63]):
+// val[0] = scales of sub-blocks 0..7, val[1] = mins of sub-blocks 0..7.
+// Both are assembled in general-purpose registers and moved over as 64-bit values: merging them
+// in a vector register with a Q-form ZIP/UZP/TBL would cost 3 uops each on the A57.
+static inline uint8x8x2_t ggml_q4q5_K_unpack_scales_mins(const uint8_t * GGML_RESTRICT packed) {
+    const uint32_t kmask1 = 0x3f3f3f3f;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    const uint32_t kmask3 = 0x03030303;
+
+    uint32_t u[3];
+    memcpy(u, packed, 12);
+
+    const uint32_t scales_0_3 = u[0] & kmask1;
+    const uint32_t scales_4_7 = (u[2] & kmask2) | (((u[0] >> 6) & kmask3) << 4);
+    const uint32_t mins_0_3   = u[1] & kmask1;
+    const uint32_t mins_4_7   = ((u[2] >> 4) & kmask2) | (((u[1] >> 6) & kmask3) << 4);
+
+    const uint8x8x2_t sm = {{
+        vcreate_u8(scales_0_3 | ((uint64_t) scales_4_7 << 32)),
+        vcreate_u8(mins_0_3   | ((uint64_t) mins_4_7   << 32)),
+    }};
+    return sm;
+}
+
+// Widens 6-bit scales/mins to int16. Sign extension (SXTL) gives the same result for values <= 63;
+// a zero extension may be emitted by GCC as a Q-form ZIP with a zero register, 3 uops on the A57.
+static inline int16x8_t ggml_q4q5_K_widen(uint8x8_t v) {
+    return vmovl_s8(vreinterpret_s8_u8(v));
+}
+
+// Sum over sub-blocks of min * (sum of the 32 q8 of the sub-block), in 4 int32 lanes.
+static inline int32x4_t ggml_q4q5_K_sum_mins(const int16_t * GGML_RESTRICT bsums, uint8x8_t mins8) {
+    // |bsums[2k] + bsums[2k+1]| <= 32*128 = 4096 fits in int16
+    const int16x8_t q8sums = vpaddq_s16(vld1q_s16(bsums), vld1q_s16(bsums + 8));
+    const int16x8_t mins   = ggml_q4q5_K_widen(mins8);
+    return vmlal_high_s16(vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins)), q8sums, mins);
+}
+
+// Products of one 32-weight sub-block, a = unsigned 4/5-bit quants in [0, 31], b = q8_K quants in [-128, 127].
+// Four widening multiply-accumulates put 4 products in each int16 lane instead of widening every
+// product to int32 like the emulated dot product does:
+// |a*b| <= 31*128 = 3968, so |lane| <= 4*3968 = 15872 (Q4_K: 4*15*128 = 7680) - no int16 overflow.
+static inline int16x8_t ggml_q4q5_K_mul32(int8x16_t a0, int8x16_t a1, int8x16_t b0, int8x16_t b1) {
+    int16x8_t p = vmull_s8(vget_low_s8(a0), vget_low_s8(b0));
+    p = vmlal_high_s8(p, a0, b0);
+    p = vmlal_s8(p, vget_low_s8(a1), vget_low_s8(b1));
+    return vmlal_high_s8(p, a1, b1);
+}
+#endif
+
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
 #ifdef __ARM_FEATURE_MATMUL_INT8
@@ -2519,6 +2575,66 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
         }
     }
     *s = sumf;
+#elif defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+    UNUSED(kmask1);
+    UNUSED(kmask2);
+    UNUSED(kmask3);
+    UNUSED(utmp);
+
+    const uint8x16_t m4b = vdupq_n_u8(0xf);
+
+    float32x4_t sumv = vdupq_n_f32(0.0f);
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const uint8x8x2_t sm   = ggml_q4q5_K_unpack_scales_mins(x[i].scales);
+        const int32x4_t   summ = ggml_q4q5_K_sum_mins(y[i].bsums, sm.val[1]);
+
+        // each scale twice as int16: {s0 s0 s1 s1 s2 s2 s3 s3} and {s4 s4 s5 s5 s6 s6 s7 s7}
+        // (widen to 32 bits, then copy the low half into the high half with SLI)
+        const int16x8_t sc16  = ggml_q4q5_K_widen(sm.val[0]);
+        const int32x4_t sc_03 = vmovl_s16(vget_low_s16(sc16));
+        const int32x4_t sc_47 = vmovl_high_s16(sc16);
+        const int16x8_t sc_lo = vreinterpretq_s16_s32(vsliq_n_s32(sc_03, sc_03, 16));
+        const int16x8_t sc_hi = vreinterpretq_s16_s32(vsliq_n_s32(sc_47, sc_47, 16));
+
+        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+
+        // p[k] = products of sub-block k, 4 per int16 lane
+        // (single-register loads: on the A57 they have lower latency than multi-register LD1, and they
+        // spare the address updates and register copies that LD1's consecutive registers require)
+        int16x8_t p[QK_K/32];
+        for (int j = 0; j < QK_K/64; ++j) {
+            const uint8x16_t q4b0 = vld1q_u8(q4 + 32*j);
+            const uint8x16_t q4b1 = vld1q_u8(q4 + 32*j + 16);
+
+            p[2*j + 0] = ggml_q4q5_K_mul32(vreinterpretq_s8_u8(vandq_u8(q4b0, m4b)),
+                                           vreinterpretq_s8_u8(vandq_u8(q4b1, m4b)),
+                                           vld1q_s8(q8 + 64*j), vld1q_s8(q8 + 64*j + 16));
+            p[2*j + 1] = ggml_q4q5_K_mul32(vreinterpretq_s8_u8(vshrq_n_u8(q4b0, 4)),
+                                           vreinterpretq_s8_u8(vshrq_n_u8(q4b1, 4)),
+                                           vld1q_s8(q8 + 64*j + 32), vld1q_s8(q8 + 64*j + 48));
+        }
+
+        // two rounds of pairwise adds: lanes 2k and 2k+1 of p0123 hold 16 products of sub-block k
+        // (|lane| <= 16*15*128 = 30720, still no int16 overflow), which lines up with sc_lo
+        const int16x8_t p0123 = vpaddq_s16(vpaddq_s16(p[0], p[1]), vpaddq_s16(p[2], p[3]));
+        const int16x8_t p4567 = vpaddq_s16(vpaddq_s16(p[4], p[5]), vpaddq_s16(p[6], p[7]));
+
+        int32x4_t sumi = vmull_s16(vget_low_s16(p0123), vget_low_s16(sc_lo));
+        sumi = vmlal_high_s16(sumi, p0123, sc_lo);
+        sumi = vmlal_s16(sumi, vget_low_s16(p4567), vget_low_s16(sc_hi));
+        sumi = vmlal_high_s16(sumi, p4567, sc_hi);
+
+        sumv = vfmaq_n_f32(sumv, vcvtq_f32_s32(sumi),  d);
+        sumv = vfmaq_n_f32(sumv, vcvtq_f32_s32(summ), -dmin);
+    }
+
+    *s = vaddvq_f32(sumv);
+
 #elif defined __ARM_NEON
     const uint8x16_t m4b = vdupq_n_u8(0xf);
     const int32x4_t mzero = vdupq_n_s32(0);
@@ -2614,7 +2730,70 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     uint32_t utmp[4];
 
 
-#ifdef __ARM_NEON
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+    UNUSED(kmask1);
+    UNUSED(kmask2);
+    UNUSED(kmask3);
+    UNUSED(utmp);
+
+    const uint8x16_t mone = vdupq_n_u8(1);
+    const uint8x16_t m16  = vdupq_n_u8(0x10);
+
+    float32x4_t sumv = vdupq_n_f32(0.0f);
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const uint8x8x2_t sm   = ggml_q4q5_K_unpack_scales_mins(x[i].scales);
+        const int32x4_t   summ = ggml_q4q5_K_sum_mins(y[i].bsums, sm.val[1]);
+
+        const int16x8_t sc = ggml_q4q5_K_widen(sm.val[0]);
+
+        const uint8_t * GGML_RESTRICT q5 = x[i].qs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+
+        // bit k of qh[l] is bit 4 of weight l of sub-block k; shifted right by 2 after every 64 weights
+        uint8x16_t qh0 = vld1q_u8(x[i].qh);
+        uint8x16_t qh1 = vld1q_u8(x[i].qh + 16);
+
+        // p[j]: lanes 0..3 = products of sub-block 2j, lanes 4..7 = sub-block 2j+1, 8 per int16 lane
+        // (one pairwise add of two ggml_q4q5_K_mul32 results: |lane| <= 8*31*128 = 31744, no int16 overflow)
+        int16x8_t p[QK_K/64];
+        for (int j = 0; j < QK_K/64; ++j) {
+            const uint8x16_t q5b0 = vld1q_u8(q5 + 32*j);
+            const uint8x16_t q5b1 = vld1q_u8(q5 + 32*j + 16);
+
+            // sub-block 2j: low nibble | (qh bit 0) << 4 - SLI keeps the low 4 bits of q5b
+            const int8x16_t l0 = vreinterpretq_s8_u8(vsliq_n_u8(q5b0, vandq_u8(qh0, mone), 4));
+            const int8x16_t l1 = vreinterpretq_s8_u8(vsliq_n_u8(q5b1, vandq_u8(qh1, mone), 4));
+            // sub-block 2j+1: high nibble | (qh bit 1) << 4 - SRI keeps the high 4 bits of the first operand
+            const int8x16_t h0 = vreinterpretq_s8_u8(vsriq_n_u8(vandq_u8(vshlq_n_u8(qh0, 3), m16), q5b0, 4));
+            const int8x16_t h1 = vreinterpretq_s8_u8(vsriq_n_u8(vandq_u8(vshlq_n_u8(qh1, 3), m16), q5b1, 4));
+
+            qh0 = vshrq_n_u8(qh0, 2);
+            qh1 = vshrq_n_u8(qh1, 2);
+
+            p[j] = vpaddq_s16(ggml_q4q5_K_mul32(l0, l1, vld1q_s8(q8 + 64*j),      vld1q_s8(q8 + 64*j + 16)),
+                              ggml_q4q5_K_mul32(h0, h1, vld1q_s8(q8 + 64*j + 32), vld1q_s8(q8 + 64*j + 48)));
+        }
+
+        int32x4_t sumi = vmull_laneq_s16(vget_low_s16(p[0]), sc, 0);
+        sumi = vmlal_high_laneq_s16(sumi, p[0], sc, 1);
+        sumi = vmlal_laneq_s16     (sumi, vget_low_s16(p[1]), sc, 2);
+        sumi = vmlal_high_laneq_s16(sumi, p[1], sc, 3);
+        sumi = vmlal_laneq_s16     (sumi, vget_low_s16(p[2]), sc, 4);
+        sumi = vmlal_high_laneq_s16(sumi, p[2], sc, 5);
+        sumi = vmlal_laneq_s16     (sumi, vget_low_s16(p[3]), sc, 6);
+        sumi = vmlal_high_laneq_s16(sumi, p[3], sc, 7);
+
+        sumv = vfmaq_n_f32(sumv, vcvtq_f32_s32(sumi),  d);
+        sumv = vfmaq_n_f32(sumv, vcvtq_f32_s32(summ), -dmin);
+    }
+
+    *s = vaddvq_f32(sumv);
+
+#elif defined __ARM_NEON
     const uint8x16_t m4b = vdupq_n_u8(0xf);
     const uint8x16_t mone = vdupq_n_u8(1);
     const uint8x16_t mtwo = vdupq_n_u8(2);

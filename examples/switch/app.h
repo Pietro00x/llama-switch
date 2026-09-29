@@ -14,6 +14,14 @@
 constexpr int k_ctx_min = 256;
 constexpr int k_ctx_max = 8192;
 
+// CPU/memory clock policy while a model is loaded (clocks.h), persisted in settings.json (settings.h)
+enum clock_mode {
+    CLOCK_MODE_STOCK = 0, // leave the system clocks alone
+    CLOCK_MODE_BOOST,     // official maximum: CPU 1785 MHz, EMC (memory) 1600 MHz, also in handheld
+    CLOCK_MODE_OVERCLOCK, // highest rates the system reports above that (needs sys-clk-OC)
+    CLOCK_MODE_COUNT,
+};
+
 struct model_entry {
     std::string name;
     std::string url;
@@ -76,7 +84,16 @@ struct app_state {
     double   load_ms   = 0.0;   // wall time of the last successful load_model
     int      n_threads = 0;     // CPU threads used for prompt and generation
     uint32_t n_ubatch  = 0;     // physical batch size used for prompt processing
-    bool     cpu_boost = false; // CPU boost mode is active (Switch only)
+    bool     cpu_boost = false; // clocks are raised above the system configuration (Switch only)
+
+    // clocks (clocks.h): the chosen mode and what is applied right now
+    clock_mode clock_setting   = CLOCK_MODE_BOOST; // chosen in the menu, applied while a model is loaded
+    uint32_t   clock_oc_cpu_hz = 0;                // CPU step in overclock mode, 0 = highest available
+    clock_mode clock_applied   = CLOCK_MODE_STOCK; // effective mode now (STOCK = untouched; OC falls back to BOOST)
+    uint32_t   clock_cpu_target_hz = 0;            // CPU rate we asked for, 0 = untouched
+    uint32_t   clock_emc_target_hz = 0;            // EMC rate we asked for, 0 = untouched
+    bool       clock_oc_available  = false;        // the system reports CPU or EMC rates above the official max
+    bool       clock_sysclk        = false;        // sys-clk is running and may override the clocks
 
     uint64_t process_total = 0;
     uint64_t process_used = 0;

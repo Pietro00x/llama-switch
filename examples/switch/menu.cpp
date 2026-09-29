@@ -1,3 +1,4 @@
+#include "clocks.h"
 #include "download.h"
 #include "engine.h"
 #include "models.h"
@@ -17,7 +18,7 @@
 //
 //   row  0       title bar
 //   rows 1-2     applet mode warning banner (blank in application mode)
-//   rows 3-18    menu (cols 0-47)            | System box rows 3-11, Help box rows 13-18 (cols 50-78)
+//   rows 3-19    menu (cols 0-47)            | System box rows 3-11, Help box rows 13-19 (cols 50-78)
 //   rows 20-28   selected model info card (cols 0-78)
 //   rows 30-39   model list box (cols 0-78, 8 entries)
 //   row  41      separator
@@ -31,6 +32,7 @@ enum menu_item : size_t {
     MENU_TEMP,
     MENU_TOP_P,
     MENU_TOP_K,
+    MENU_CLOCK,
     MENU_LOAD,
     MENU_CHAT,
     MENU_UNLOAD,
@@ -48,12 +50,12 @@ struct menu_section {
 
 static const menu_section k_sections[] = {
     { "MODEL",    3,  MENU_MODEL,   MENU_DOWNLOAD },
-    { "SAMPLING", 7,  MENU_CONTEXT, MENU_TOP_K    },
-    { "ACTIONS",  13, MENU_LOAD,    MENU_EXIT     },
+    { "SETTINGS", 7,  MENU_CONTEXT, MENU_CLOCK    },
+    { "ACTIONS",  14, MENU_LOAD,    MENU_EXIT     },
 };
 static const size_t k_section_count = sizeof(k_sections) / sizeof(k_sections[0]);
 
-static const int k_item_rows[MENU_COUNT] = { 4, 5, 8, 9, 10, 11, 14, 15, 16, 17, 18 };
+static const int k_item_rows[MENU_COUNT] = { 4, 5, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19 };
 
 constexpr int k_menu_col   = 1;  // menu rows span cols 1-47, the selection marker is in col 0
 constexpr int k_menu_width = 47;
@@ -88,6 +90,8 @@ struct menu_view {
     uint32_t    drawn_cpu   = 0;
     uint32_t    drawn_gpu   = 0;
     uint32_t    drawn_emc   = 0;
+    uint32_t    drawn_cpu_target = 0;
+    uint32_t    drawn_emc_target = 0;
     uint64_t    last_stats_check_us = 0;
 
     // hold-to-repeat for the direction buttons
@@ -149,7 +153,7 @@ static int menu_section_of(size_t item) {
 static const char * menu_status_color(const std::string & status) {
     const std::string s = to_lower_ascii(status);
     static const char * const k_error[] = { "fail", "error", "not found", "invalid", "cannot", "missing" };
-    static const char * const k_warn[]  = { "cancel", "fallback", "first", "warning", "no model" };
+    static const char * const k_warn[]  = { "cancel", "fallback", "first", "warning", "no model", "not available", "sys-clk" };
     static const char * const k_ok[]    = { "loaded", "complete", "selected", "updated", "reloaded", "ready" };
     for (const char * w : k_error) {
         if (s.find(w) != std::string::npos) {
@@ -321,6 +325,15 @@ static void draw_menu(const app_state & state, const menu_view & view) {
         menu_fmt(clamp_top_p(state.top_p), 2), clamp_top_p(state.top_p), "");
     draw_value_item(k_item_rows[MENU_TOP_K], c == MENU_TOP_K, "Top-k",
         menu_fmt_int(clamp_top_k(state.top_k)), (double) (clamp_top_k(state.top_k) - 1) / 199.0, "");
+    {
+        // "< Boost     >  1785/1600 MHz": the CPU/EMC rates the chosen mode asks for
+        const clock_plan plan = clocks_plan_for(state);
+        const std::string value = "< " + ui_fit(clock_mode_name(state.clock_setting), 9) + " >";
+        const std::string rates = plan.mode == CLOCK_MODE_STOCK ? std::string("  system clocks")
+            : "  " + clock_fmt_mhz(plan.cpu_hz) + "/" + clock_fmt_mhz(plan.emc_hz) + " MHz";
+        draw_item(k_item_rows[MENU_CLOCK], c == MENU_CLOCK, true, "CPU clock", value,
+            state.clock_setting == CLOCK_MODE_OVERCLOCK ? UI_FG_MAGENTA : UI_FG_YELLOW, rates, UI_FG_CYAN);
+    }
 
     // actions
     if (!sel) {
@@ -349,6 +362,15 @@ static void draw_side_line(int row, const char * color, const std::string & text
     std::printf("%s%s" UI_RESET, color, ui_fit(text, k_side_width - 4).c_str());
 }
 
+// raised clock: green while it holds, yellow when something else (the system, sys-clk) changed it
+static const char * menu_clock_color(uint32_t live_hz, uint32_t target_hz) {
+    if (target_hz == 0) {
+        return UI_FG_GRAY;
+    }
+    const uint32_t diff = live_hz > target_hz ? live_hz - target_hz : target_hz - live_hz;
+    return diff <= 2000000 ? UI_FG_GREEN : UI_FG_YELLOW;
+}
+
 static void draw_stats_box(const app_state & state, const menu_view & view) {
     const int top = 3;
     std::printf(UI_FG_CYAN);
@@ -363,9 +385,11 @@ static void draw_stats_box(const app_state & state, const menu_view & view) {
     std::printf("%s%s" UI_RESET " %s", menu_usage_color(frac), ui_progress_bar(frac, 18).c_str(),
         menu_align_right(menu_fmt_int((int) (frac * 100.0 + 0.5)) + "%", 4).c_str());
     draw_side_line(top + 3, UI_FG_GRAY, "Free " + fmt_mb(free_bytes));
-    draw_side_line(top + 4, UI_FG_GRAY, "CPU  " + fmt_hz(state.cpu_hz));
+    const char * tag = state.clock_applied == CLOCK_MODE_OVERCLOCK ? "  OC" :
+        state.clock_applied == CLOCK_MODE_BOOST ? "  Boost" : "";
+    draw_side_line(top + 4, menu_clock_color(state.cpu_hz, state.clock_cpu_target_hz), "CPU  " + fmt_hz(state.cpu_hz) + tag);
     draw_side_line(top + 5, UI_FG_GRAY, "GPU  " + fmt_hz(state.gpu_hz));
-    draw_side_line(top + 6, UI_FG_GRAY, "EMC  " + fmt_hz(state.emc_hz));
+    draw_side_line(top + 6, menu_clock_color(state.emc_hz, state.clock_emc_target_hz), "EMC  " + fmt_hz(state.emc_hz));
     if (view.applet_mode) {
         draw_side_line(top + 7, UI_FG_RED, "Mode applet (low RAM)");
     } else {
@@ -373,7 +397,20 @@ static void draw_stats_box(const app_state & state, const menu_view & view) {
     }
 }
 
-static const char * menu_help_text(size_t item) {
+static const char * menu_clock_help(const app_state & state) {
+    switch (state.clock_setting) {
+        case CLOCK_MODE_STOCK:
+            return "Clocks while a model is loaded. Stock: system clocks. Right: Boost.";
+        case CLOCK_MODE_OVERCLOCK:
+            return "Overclock: highest rates allowed. Hot, drains battery. Left: lower CPU.";
+        default:
+            return state.clock_oc_available
+                ? "Boost: CPU 1785, RAM 1600 MHz while a model is loaded. Right: Overclock."
+                : "Boost: CPU 1785, RAM 1600 MHz. Overclock n/a: needs sys-clk-OC.";
+    }
+}
+
+static const char * menu_help_text(const app_state & state, size_t item) {
     switch (item) {
         case MENU_MODEL:       return "Left/Right picks a model from models.json and applies its preset.";
         case MENU_DOWNLOAD:    return "Downloads the GGUF file from its URL to the SD card. B cancels.";
@@ -381,6 +418,7 @@ static const char * menu_help_text(size_t item) {
         case MENU_TEMP:        return "Randomness of the reply. 0 = always the most likely token.";
         case MENU_TOP_P:       return "Keeps the smallest set of tokens whose probability adds up to top-p.";
         case MENU_TOP_K:       return "Samples only among the K most likely tokens.";
+        case MENU_CLOCK:       return menu_clock_help(state);
         case MENU_LOAD:        return "Loads the selected model into RAM (CPU inference).";
         case MENU_CHAT:        return "Opens the chat screen for the loaded model.";
         case MENU_UNLOAD:      return "Frees the model and its context memory.";
@@ -390,16 +428,25 @@ static const char * menu_help_text(size_t item) {
     }
 }
 
-static void draw_help_box(const menu_view & view) {
+static void draw_help_box(const app_state & state, const menu_view & view) {
     const int top = 13;
-    const int height = 6;
+    const int height = 7;
     std::printf(UI_FG_CYAN);
     ui_box(top, k_side_col, height, k_side_width, "Help");
     std::printf(UI_RESET);
 
-    const std::vector<std::string> lines = ui_wrap(menu_help_text(view.cursor), k_side_width - 4);
-    for (size_t i = 0; i < lines.size() && (int) i < height - 2; ++i) {
+    // the sys-clk note goes to the bottom lines, the help text keeps the rest
+    std::vector<std::string> note;
+    if (view.cursor == MENU_CLOCK && state.clock_sysclk) {
+        note = ui_wrap("sys-clk detected: it may override these clocks.", k_side_width - 4);
+    }
+    const int text_rows = height - 2 - (int) note.size();
+    const std::vector<std::string> lines = ui_wrap(menu_help_text(state, view.cursor), k_side_width - 4);
+    for (size_t i = 0; i < lines.size() && (int) i < text_rows; ++i) {
         draw_side_line(top + 1 + (int) i, UI_FG_GRAY, lines[i]);
+    }
+    for (size_t i = 0; i < note.size(); ++i) {
+        draw_side_line(top + 1 + text_rows + (int) i, UI_FG_YELLOW, note[i]);
     }
 }
 
@@ -535,7 +582,7 @@ static void render_menu(const app_state & state, const menu_view & view) {
     draw_applet_banner(state, view);
     draw_menu(state, view);
     draw_stats_box(state, view);
-    draw_help_box(view);
+    draw_help_box(state, view);
     draw_model_card(state, view);
     draw_model_list(state, view);
     draw_status(state);
@@ -558,7 +605,57 @@ static float menu_round_2(float v) {
     return std::round(v * 100.0f) / 100.0f;
 }
 
-static void adjust_selected_item(app_state & state, menu_view & view, int dir) {
+// Left/Right on "CPU clock": Stock, Boost, Overclock (asks first), then the Overclock CPU steps
+static void menu_adjust_clock(app_state & state, menu_view & view, PadState & pad, int dir) {
+    // one step per press, no hold-to-repeat: every step is applied and saved, and holding Right from Stock
+    // must not run into the overclock warning
+    if (!(padGetButtonsDown(&pad) & (HidNpadButton_AnyLeft | HidNpadButton_AnyRight))) {
+        return;
+    }
+    const clock_step step = clock_step_setting(state.clock_setting, state.clock_oc_cpu_hz, clocks_oc_cpu_steps(),
+        state.clock_oc_available, dir);
+    if (step.unavailable) {
+        state.status = "Overclock not available (needs sys-clk-OC): staying on Boost";
+        return;
+    }
+    if (step.mode == state.clock_setting && step.oc_cpu_hz == state.clock_oc_cpu_hz) {
+        return;
+    }
+    if (step.confirm) {
+        const bool ok = ui_confirm(pad, "Overclock goes above Nintendo's limits: more heat, faster battery drain, "
+            "possible freezes or crashes. At your own risk - enable it?");
+        // a direction still held after the dialog must not open it again
+        view.repeat_buttons = 0;
+        if (!ok) {
+            state.status = "Overclock cancelled";
+            return;
+        }
+    }
+
+    std::string err;
+    const bool saved = clocks_set_setting(state, step.mode, step.oc_cpu_hz, err);
+
+    const clock_plan plan = clocks_plan_for(state);
+    std::string msg = std::string("CPU clock updated: ") + clock_mode_name(state.clock_setting);
+    if (plan.mode == CLOCK_MODE_STOCK) {
+        msg += " (system clocks)";
+    } else {
+        msg += " (CPU " + clock_fmt_mhz(plan.cpu_hz) + " / EMC " + clock_fmt_mhz(plan.emc_hz) + " MHz)";
+    }
+    if (!state.model) {
+        msg += ", used from the next Load";
+    }
+    if (state.clock_sysclk && plan.mode != CLOCK_MODE_STOCK) {
+        msg += " - sys-clk detected: it may override it";
+    }
+    if (!saved) {
+        msg += " - not saved: " + err;
+    }
+    state.status = msg;
+    state.last_stats_us = 0; // show the new clocks right away
+}
+
+static void adjust_selected_item(app_state & state, menu_view & view, PadState & pad, int dir) {
     switch (view.cursor) {
         case MENU_MODEL: {
             if (state.models.empty()) {
@@ -584,6 +681,9 @@ static void adjust_selected_item(app_state & state, menu_view & view, int dir) {
         case MENU_TOP_K:
             state.top_k = clamp_top_k(state.top_k + dir);
             state.status = "Top-k updated";
+            break;
+        case MENU_CLOCK:
+            menu_adjust_clock(state, view, pad, dir);
             break;
         default:
             break;
@@ -748,7 +848,8 @@ static bool menu_stats_changed(const app_state & state, const menu_view & view) 
     // ignore RAM changes below 1 MB to avoid redrawing for allocator noise
     const uint64_t mb = 1024 * 1024;
     return state.process_used / mb != view.drawn_used / mb || state.process_total != view.drawn_total ||
-        state.cpu_hz != view.drawn_cpu || state.gpu_hz != view.drawn_gpu || state.emc_hz != view.drawn_emc;
+        state.cpu_hz != view.drawn_cpu || state.gpu_hz != view.drawn_gpu || state.emc_hz != view.drawn_emc ||
+        state.clock_cpu_target_hz != view.drawn_cpu_target || state.clock_emc_target_hz != view.drawn_emc_target;
 }
 
 void run_main_menu(app_state & state, PadState & pad) {
@@ -778,6 +879,8 @@ void run_main_menu(app_state & state, PadState & pad) {
             view.drawn_cpu    = state.cpu_hz;
             view.drawn_gpu    = state.gpu_hz;
             view.drawn_emc    = state.emc_hz;
+            view.drawn_cpu_target = state.clock_cpu_target_hz;
+            view.drawn_emc_target = state.clock_emc_target_hz;
             view.dirty = false;
         }
 
@@ -793,10 +896,10 @@ void run_main_menu(app_state & state, PadState & pad) {
             view.dirty = true;
         }
         if (k_move & HidNpadButton_AnyLeft) {
-            adjust_selected_item(state, view, -1);
+            adjust_selected_item(state, view, pad, -1);
             view.dirty = true;
         } else if (k_move & HidNpadButton_AnyRight) {
-            adjust_selected_item(state, view, +1);
+            adjust_selected_item(state, view, pad, +1);
             view.dirty = true;
         }
         if (k_down & (HidNpadButton_L | HidNpadButton_ZL)) {

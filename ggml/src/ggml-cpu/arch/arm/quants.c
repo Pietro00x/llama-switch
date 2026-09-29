@@ -2694,6 +2694,74 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_SVE)
+// Q6_K x Q8_K for one 128-weight half of a superblock (8 scale groups of 16 weights), without dotprod.
+// Switch port addition (not upstream): the __SWITCH__ Cortex-A57 has no dotprod. Re-apply after sync-ggml.sh.
+// The q6 values are used unsigned (0..63, the caller subtracts the -32 offset via bsums), so with q8 in
+// -128..127 a product is at most 63*128 = 8064 in magnitude and 4 of them fit an int16 lane (32256 < 32768):
+//   - per group, SMULL + SMLAL2 sum 2 products per int16 lane
+//   - ADDP of two adjacent groups sums 4 per lane (lanes 0-3: first group, lanes 4-7: second group)
+//   - SMLAL/SMLAL2 by the group's scale lane widen into the int32 accumulators
+// This avoids the per-group horizontal reductions and scalar multiply-adds of the generic NEON path.
+static inline int16x8_t ggml_vec_dot_q6_K_q8_K_pair_nodot(const uint8x16_t q6a, const uint8x16_t q6b, const int8_t * GGML_RESTRICT q8) {
+    const int8x16_t xa = vreinterpretq_s8_u8(q6a);
+    const int8x16_t xb = vreinterpretq_s8_u8(q6b);
+    const int8x16_t ya = vld1q_s8(q8);
+    const int8x16_t yb = vld1q_s8(q8 + 16);
+
+    const int16x8_t pa = vmlal_high_s8(vmull_s8(vget_low_s8(xa), vget_low_s8(ya)), xa, ya);
+    const int16x8_t pb = vmlal_high_s8(vmull_s8(vget_low_s8(xb), vget_low_s8(yb)), xb, yb);
+
+    return vpaddq_s16(pa, pb);
+}
+
+static inline void ggml_vec_dot_q6_K_q8_K_half_nodot(int32x4_t * GGML_RESTRICT acc0, int32x4_t * GGML_RESTRICT acc1,
+        const uint8_t * GGML_RESTRICT ql, const uint8_t * GGML_RESTRICT qh, const int8_t * GGML_RESTRICT q8, const int16x8_t sc) {
+    const uint8x16_t m0f = vdupq_n_u8(0x0F);
+    const uint8x16_t m30 = vdupq_n_u8(0x30);
+    const uint8x16_t m3f = vdupq_n_u8(0x3F);
+
+    const ggml_uint8x16x2_t qhbits = ggml_vld1q_u8_x2(qh);
+    const ggml_uint8x16x4_t qlbits = ggml_vld1q_u8_x4(ql);
+
+    int32x4_t a0 = *acc0;
+    int32x4_t a1 = *acc1;
+    int16x8_t p;
+    uint8x16_t q6a, q6b;
+
+    // weights   0.. 31: low  nibbles of ql[ 0..31] | qh bits 0-1 << 4 (groups 0, 1)
+    q6a = vandq_u8(vbslq_u8(m0f, qlbits.val[0], vshlq_n_u8(qhbits.val[0], 4)), m3f);
+    q6b = vandq_u8(vbslq_u8(m0f, qlbits.val[1], vshlq_n_u8(qhbits.val[1], 4)), m3f);
+    p   = ggml_vec_dot_q6_K_q8_K_pair_nodot(q6a, q6b, q8 + 0);
+    a0  = vmlal_laneq_s16     (a0, vget_low_s16(p), sc, 0);
+    a1  = vmlal_high_laneq_s16(a1, p,               sc, 1);
+
+    // weights  32.. 63: low  nibbles of ql[32..63] | qh bits 2-3 << 4 (groups 2, 3)
+    q6a = vandq_u8(vbslq_u8(m0f, qlbits.val[2], vshlq_n_u8(qhbits.val[0], 2)), m3f);
+    q6b = vandq_u8(vbslq_u8(m0f, qlbits.val[3], vshlq_n_u8(qhbits.val[1], 2)), m3f);
+    p   = ggml_vec_dot_q6_K_q8_K_pair_nodot(q6a, q6b, q8 + 32);
+    a0  = vmlal_laneq_s16     (a0, vget_low_s16(p), sc, 2);
+    a1  = vmlal_high_laneq_s16(a1, p,               sc, 3);
+
+    // weights  64.. 95: high nibbles of ql[ 0..31] | qh bits 4-5 << 4 (groups 4, 5)
+    q6a = vsraq_n_u8(vandq_u8(qhbits.val[0], m30), qlbits.val[0], 4);
+    q6b = vsraq_n_u8(vandq_u8(qhbits.val[1], m30), qlbits.val[1], 4);
+    p   = ggml_vec_dot_q6_K_q8_K_pair_nodot(q6a, q6b, q8 + 64);
+    a0  = vmlal_laneq_s16     (a0, vget_low_s16(p), sc, 4);
+    a1  = vmlal_high_laneq_s16(a1, p,               sc, 5);
+
+    // weights  96..127: high nibbles of ql[32..63] | qh bits 6-7 << 4 (groups 6, 7)
+    q6a = vsraq_n_u8(vandq_u8(vshrq_n_u8(qhbits.val[0], 2), m30), qlbits.val[2], 4);
+    q6b = vsraq_n_u8(vandq_u8(vshrq_n_u8(qhbits.val[1], 2), m30), qlbits.val[3], 4);
+    p   = ggml_vec_dot_q6_K_q8_K_pair_nodot(q6a, q6b, q8 + 96);
+    a0  = vmlal_laneq_s16     (a0, vget_low_s16(p), sc, 6);
+    a1  = vmlal_high_laneq_s16(a1, p,               sc, 7);
+
+    *acc0 = a0;
+    *acc1 = a1;
+}
+#endif
+
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
 #ifdef __ARM_FEATURE_MATMUL_INT8
@@ -3220,6 +3288,39 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
         }
     }
 
+    *s = sum;
+
+#elif defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+    // AArch64 without dotprod (e.g. the Switch's Cortex-A57): see ggml_vec_dot_q6_K_q8_K_half_nodot
+    float sum = 0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d_all = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        const int8x16_t scales = vld1q_s8(x[i].scales);
+        const int16x8_t sc0 = vmovl_s8(vget_low_s8(scales));
+        const int16x8_t sc1 = vmovl_high_s8(scales);
+
+        // the -32 offset of the q6 values: isum -= 32 * sum_g(scale_g * bsum_g)
+        // |32*scale| <= 4096 and |bsum| <= 16*128 fit in int16, their product in int32
+        const ggml_int16x8x2_t q8sums = ggml_vld1q_s16_x2(y[i].bsums);
+        const int16x8_t sc0x32 = vshlq_n_s16(sc0, 5);
+        const int16x8_t sc1x32 = vshlq_n_s16(sc1, 5);
+
+        int32x4_t acc0 = vdupq_n_s32(0);
+        int32x4_t acc1 = vdupq_n_s32(0);
+        acc0 = vmlsl_s16     (acc0, vget_low_s16(q8sums.val[0]), vget_low_s16(sc0x32));
+        acc1 = vmlsl_high_s16(acc1, q8sums.val[0], sc0x32);
+        acc0 = vmlsl_s16     (acc0, vget_low_s16(q8sums.val[1]), vget_low_s16(sc1x32));
+        acc1 = vmlsl_high_s16(acc1, q8sums.val[1], sc1x32);
+
+        ggml_vec_dot_q6_K_q8_K_half_nodot(&acc0, &acc1, x[i].ql,      x[i].qh,      y[i].qs,       sc0);
+        ggml_vec_dot_q6_K_q8_K_half_nodot(&acc0, &acc1, x[i].ql + 64, x[i].qh + 32, y[i].qs + 128, sc1);
+
+        const int32_t isum = vaddvq_s32(vaddq_s32(acc0, acc1));
+
+        sum += d_all * y[i].d * isum;
+    }
     *s = sum;
 
 #elif __ARM_NEON

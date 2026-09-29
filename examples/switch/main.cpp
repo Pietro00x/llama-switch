@@ -1,3 +1,4 @@
+#include "clocks.h"
 #include "download.h"
 #include "engine.h"
 #include "models.h"
@@ -39,9 +40,16 @@ int main(int argc, char ** argv) {
         apply_selected_model_defaults(state);
     }
 
+    // CPU clock setting from settings.json, possible rates, sys-clk detection, re-apply hooks
+    const std::string clock_note = clocks_init(state);
+    if (!clock_note.empty()) {
+        state.status += " - " + clock_note;
+    }
+
     run_main_menu(state, pad);
 
     unload_model(state);
+    clocks_exit(state); // after unload_model: never leave the clocks raised
     download_exit();
     sysinfo_exit();
     llama_backend_free();

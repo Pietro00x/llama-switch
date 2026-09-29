@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "clocks.h"
 #include "generate.h"
 
 #include "ggml-cpu.h"
@@ -127,13 +128,13 @@ static void engine_abort_callback(const char * message) {
         engine_log_write("\n", true);
         g_log_mutex.unlock();
     }
+    // the process dies next: do not leave the clocks raised for the homebrew menu
+    clocks_restore_emergency();
     std::fprintf(stderr, "GGML_ABORT: %s\n", message);
 }
 #endif
 
-static void engine_log_printf(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
-
-static void engine_log_printf(const char * fmt, ...) {
+void engine_log_printf(const char * fmt, ...) {
 #ifdef __SWITCH__
     char buf[512];
     va_list args;
@@ -200,22 +201,6 @@ static int engine_pick_n_threads() {
 #endif
 }
 
-// FastLoad boosts the CPU to 1785 MHz (and drops the GPU to its minimum, unused by the console UI).
-// Available to all applet types on 7.0.0+; failures are logged and otherwise ignored.
-static bool engine_set_cpu_boost(bool enable) {
-#ifdef __SWITCH__
-    const Result rc = appletSetCpuBoostMode(enable ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
-    if (R_FAILED(rc)) {
-        engine_log_printf("appletSetCpuBoostMode(%d) failed: 0x%x\n", enable ? 1 : 0, (unsigned) rc);
-        return false;
-    }
-    return enable;
-#else
-    (void) enable;
-    return false;
-#endif
-}
-
 static uint32_t engine_pick_n_ubatch(const llama_model * model, uint32_t n_ctx) {
     // llama_encode needs the whole encoder input in one ubatch (asserts n_ubatch >= n_tokens)
     if (llama_model_has_encoder(model)) {
@@ -257,7 +242,7 @@ bool engine_rebuild_sampler(app_state & state, std::string & err) {
     return true;
 }
 
-// frees everything but keeps the CPU boost state (load_model reuses it when switching models)
+// frees everything but keeps the clocks raised (load_model reuses them when switching models)
 static void engine_free(app_state & state) {
     // drops the KV bookkeeping and state snapshots (up to 128 MB) that refer to the context
     generate_reset_cache(state);
@@ -286,10 +271,7 @@ static void engine_free(app_state & state) {
 
 void unload_model(app_state & state) {
     engine_free(state);
-    if (state.cpu_boost) {
-        engine_set_cpu_boost(false);
-        state.cpu_boost = false;
-    }
+    clocks_restore(state);
     engine_log_flush();
 }
 
@@ -312,10 +294,8 @@ bool load_model(app_state & state, std::string & err) {
     engine_log_printf("load_model: %s\n", selected.path.c_str());
     const int64_t t_start_us = ggml_time_us();
 
-    // boost while a model is loaded: loading, prefill and generation are all CPU bound
-    if (!state.cpu_boost) {
-        state.cpu_boost = engine_set_cpu_boost(true);
-    }
+    // raise the clocks while a model is loaded: loading, prefill and generation are all CPU and memory bound
+    clocks_apply(state);
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0;

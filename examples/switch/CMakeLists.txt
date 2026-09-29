@@ -13,6 +13,9 @@ add_executable(${TARGET}
     engine.cpp
     generate.cpp
     download.cpp
+    clocks.cpp
+    clocks_switch.cpp
+    settings.cpp
     )
 
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/vendor)

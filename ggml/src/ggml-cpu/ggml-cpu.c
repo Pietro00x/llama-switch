@@ -2636,6 +2636,45 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
+#elif defined(__SWITCH__)
+// Horizon (Nintendo Switch homebrew, libnx). <switch.h> is not included: its u8/u16/... typedefs clash with
+// identifiers in this file. Prototype as in libnx <switch/kernel/svc.h> (Result and Handle are u32 there).
+uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferred_core, uint32_t affinity_mask);
+
+#define GGML_SWITCH_CUR_THREAD_HANDLE 0xFFFF8000u
+#define GGML_SWITCH_N_CORES           4
+
+// mask[i] = core i. The kernel rejects cores outside the process core mask (homebrew: cores 0-2).
+static bool ggml_thread_apply_affinity(const bool * mask) {
+    uint32_t core_mask = 0;
+    int32_t  n_cores   = 0;
+    int32_t  core      = -1;
+    for (int32_t i = 0; i < GGML_SWITCH_N_CORES; i++) {
+        if (mask[i]) {
+            core_mask |= 1u << i;
+            core = i;
+            n_cores++;
+        }
+    }
+    if (core_mask == 0) {
+        return false;
+    }
+    // a single core (strict_cpu) is also the ideal core; otherwise -1 = no ideal core, as libnx's pthread_create
+    const uint32_t rc = svcSetThreadCoreMask(GGML_SWITCH_CUR_THREAD_HANDLE, n_cores == 1 ? core : -1, core_mask);
+    if (rc != 0) {
+        GGML_LOG_WARN("%s: svcSetThreadCoreMask(0x%x) failed: 0x%x\n", __func__, (unsigned) core_mask, (unsigned) rc);
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_thread_apply_priority(int32_t prio) {
+    // keep libnx's defaults (workers 0x3B, the only time-sliced priority on the application cores):
+    // spinning threads of equal higher priority on one core are never preempted
+    UNUSED(prio);
+    return true;
+}
+
 #else // unsupported platforms
 
 static bool ggml_thread_apply_affinity(const bool * mask) {

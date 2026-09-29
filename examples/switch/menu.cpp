@@ -19,6 +19,7 @@
 //   row  0       title bar
 //   rows 1-2     applet mode warning banner (blank in application mode)
 //   rows 3-19    menu (cols 0-47)            | System box rows 3-11, Help box rows 13-19 (cols 50-78)
+//                MODEL 3-5, SETTINGS 7-12, ACTIONS 13-19 (no blank row before ACTIONS: 13 items + 3 headers)
 //   rows 20-28   selected model info card (cols 0-78)
 //   rows 30-39   model list box (cols 0-78, 8 entries)
 //   row  41      separator
@@ -35,6 +36,7 @@ enum menu_item : size_t {
     MENU_CLOCK,
     MENU_LOAD,
     MENU_CHAT,
+    MENU_BENCH,
     MENU_UNLOAD,
     MENU_RELOAD_JSON,
     MENU_EXIT,
@@ -51,11 +53,11 @@ struct menu_section {
 static const menu_section k_sections[] = {
     { "MODEL",    3,  MENU_MODEL,   MENU_DOWNLOAD },
     { "SETTINGS", 7,  MENU_CONTEXT, MENU_CLOCK    },
-    { "ACTIONS",  14, MENU_LOAD,    MENU_EXIT     },
+    { "ACTIONS",  13, MENU_LOAD,    MENU_EXIT     },
 };
 static const size_t k_section_count = sizeof(k_sections) / sizeof(k_sections[0]);
 
-static const int k_item_rows[MENU_COUNT] = { 4, 5, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19 };
+static const int k_item_rows[MENU_COUNT] = { 4, 5, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19 };
 
 constexpr int k_menu_col   = 1;  // menu rows span cols 1-47, the selection marker is in col 0
 constexpr int k_menu_width = 47;
@@ -348,9 +350,11 @@ static void draw_menu(const app_state & state, const menu_view & view) {
     if (state.model) {
         draw_item(k_item_rows[MENU_CHAT], c == MENU_CHAT, true, "Chat", "A to open chat",
             UI_FG_CYAN, " (" + menu_fmt_int((int) state.chat_turns.size()) + " turns)", UI_FAINT);
+        draw_item(k_item_rows[MENU_BENCH], c == MENU_BENCH, true, "Benchmark", "A to measure speed", UI_FG_CYAN, "", UI_RESET);
         draw_item(k_item_rows[MENU_UNLOAD], c == MENU_UNLOAD, true, "Unload model", "A to free memory", UI_FG_CYAN, "", UI_RESET);
     } else {
         draw_item(k_item_rows[MENU_CHAT], c == MENU_CHAT, false, "Chat", "load a model first", UI_FAINT, "", UI_RESET);
+        draw_item(k_item_rows[MENU_BENCH], c == MENU_BENCH, false, "Benchmark", "load a model first", UI_FAINT, "", UI_RESET);
         draw_item(k_item_rows[MENU_UNLOAD], c == MENU_UNLOAD, false, "Unload model", "nothing loaded", UI_FAINT, "", UI_RESET);
     }
     draw_item(k_item_rows[MENU_RELOAD_JSON], c == MENU_RELOAD_JSON, true, "Reload JSON", "re-read models.json", UI_FG_CYAN, "", UI_RESET);
@@ -421,6 +425,7 @@ static const char * menu_help_text(const app_state & state, size_t item) {
         case MENU_CLOCK:       return menu_clock_help(state);
         case MENU_LOAD:        return "Loads the selected model into RAM (CPU inference).";
         case MENU_CHAT:        return "Opens the chat screen for the loaded model.";
+        case MENU_BENCH:       return "Measures prompt/generation speed and memory bandwidth; saves bench.txt.";
         case MENU_UNLOAD:      return "Frees the model and its context memory.";
         case MENU_RELOAD_JSON: return "Re-reads models.json from the SD card after editing it.";
         case MENU_EXIT:        return "Frees everything and returns to the homebrew menu.";
@@ -777,6 +782,10 @@ static void run_action(app_state & state, menu_view & view, PadState & pad) {
 
         case MENU_CHAT:
             run_chat_screen(state, pad);
+            break;
+
+        case MENU_BENCH:
+            run_bench_screen(state, pad);
             break;
 
         case MENU_UNLOAD:

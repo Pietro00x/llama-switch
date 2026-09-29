@@ -13,6 +13,7 @@
 
 constexpr int k_ctx_min = 256;
 constexpr int k_ctx_max = 8192;
+constexpr int k_pool_threads_max = 8; // largest thread pool engine.cpp creates (host; the Switch uses 3)
 
 struct model_entry {
     std::string name;
@@ -77,6 +78,18 @@ struct app_state {
     int      n_threads = 0;     // CPU threads used for prompt and generation
     uint32_t n_ubatch  = 0;     // physical batch size used for prompt processing
     bool     cpu_boost = false; // CPU boost mode is active (Switch only)
+
+    // thread pinning experiment (default off): one core per ggml thread instead of the kernel's placement.
+    // pin_threads is the setting (applied by load_model / engine_set_pin_threads), threads_pinned what
+    // `threadpool` uses.
+    bool pin_threads    = false;
+    bool threads_pinned = false;
+    // every pool created for the loaded context, by [pinned][n_threads - 1] (engine.cpp; `threadpool` is one
+    // of them), reused by later benchmark runs and freed after the context. The CPU backend keeps a pointer
+    // to the pool of its last decode and pauses it when the next decode uses another one, so a swapped-out
+    // pool may still be referenced; engine.cpp does not track which, and the table is small (Switch: at
+    // most 6 pools with 6 worker threads in total, sleeping while unused).
+    ggml_threadpool * threadpools[2][k_pool_threads_max] = {};
 
     uint64_t process_total = 0;
     uint64_t process_used = 0;

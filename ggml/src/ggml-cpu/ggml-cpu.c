@@ -50,6 +50,10 @@
 #include "llamafile/sgemm.h"
 #endif
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "arch/arm/gemv-a57.h" // defines GGML_CPU_GEMV_A57 on cores without dotprod
+#endif
+
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
@@ -1172,6 +1176,38 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
+
+#ifdef GGML_CPU_GEMV_A57
+    // single-token decode on NEON cores without dotprod (Cortex-A57): one src1 column, so compute the
+    // chunk's src0 rows 4 at a time with a multi-row GEMV kernel instead of one vec_dot call per row.
+    // The Q8_0 kernel needs activations in [-127, 127], i.e. quantized here by from_float.
+    if (ne11 == 1 && vec_dot_type == GGML_TYPE_Q8_0 &&
+        (type == GGML_TYPE_Q4_0 || (type == GGML_TYPE_Q8_0 && src1->type != vec_dot_type))) {
+        for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+            // ne1 == ne11 == 1, so i11 == 0
+            const int64_t i13 = ir1 / ne12;
+            const int64_t i12 = ir1 - i13 * ne12;
+
+            // broadcast src0 into src1
+            const int64_t i03 = i13 / r3;
+            const int64_t i02 = i12 / r2;
+
+            const char * src0_rows = (const char *) src0->data + (ir0_start * nb01 + i02 * nb02 + i03 * nb03);
+            const char * src1_col  = (const char *) wdata +
+                (src1_cont || src1->type != vec_dot_type
+                    ? (i12 + i13 * ne12) * row_size
+                    : (i12 * nb12 + i13 * nb13));
+            float * dst_rows = (float *) ((char *) dst->data + (i12 * nb2 + i13 * nb3)) + ir0_start;
+
+            if (type == GGML_TYPE_Q4_0) {
+                ggml_gemv_a57_q4_0_q8_0((int) ne00, dst_rows, src0_rows, nb01, src1_col, (int) (ir0_end - ir0_start));
+            } else {
+                ggml_gemv_a57_q8_0_q8_0((int) ne00, dst_rows, src0_rows, nb01, src1_col, (int) (ir0_end - ir0_start));
+            }
+        }
+        return;
+    }
+#endif
 
     // block-tiling attempt
     const int64_t blck_0 = 16;

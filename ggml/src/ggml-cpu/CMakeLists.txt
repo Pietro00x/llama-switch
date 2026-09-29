@@ -125,7 +125,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/arm/quants.c
             ggml-cpu/arch/arm/repack.cpp
+            ggml-cpu/arch/arm/gemv-a57.c
+            ggml-cpu/arch/arm/gemv-a57.h
             )
+
+        if (DEFINED GGML_CPU_GEMV_A57_PREFETCH)
+            # software prefetch distance in bytes (0 = off) of the single-token GEMV kernels for cores without dotprod
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GEMV_A57_PREFETCH=${GGML_CPU_GEMV_A57_PREFETCH})
+        endif()
 
         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
             message(FATAL_ERROR "MSVC is not supported for ARM, use clang")

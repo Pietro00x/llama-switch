@@ -137,6 +137,52 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
 //===================================== Dot products =================================
 
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+// No-dotprod q4_0/q8_0 dot products (Switch port: speeds up the Cortex-A57, but not gated on __SWITCH__ because
+// every AArch64 CPU without dotprod benefits; re-apply after scripts/sync-ggml.sh).
+// They sum 4 blocks per iteration with int16 accumulation instead of the int32 ggml_vdotq_s32 emulation.
+
+// 4 fp16 block scales -> float32x4_t, one lane per block.
+// Packing the scales in a general-purpose register keeps the ASIMD pipes free for the dot product.
+static inline float32x4_t ggml_neon_fp16x4_to_fp32(ggml_fp16_t d0, ggml_fp16_t d1, ggml_fp16_t d2, ggml_fp16_t d3) {
+    const uint32_t d01 = (uint32_t) d0 | ((uint32_t) d1 << 16);
+    const uint32_t d23 = (uint32_t) d2 | ((uint32_t) d3 << 16);
+    return vcvt_f32_f16(vreinterpret_f16_u16(vcreate_u16((uint64_t) d01 | ((uint64_t) d23 << 32))));
+}
+
+// the 32 products (q4 - 8) * q8 of one block, 4 per int16 lane.
+// |(q4 - 8) * q8| <= 8*128 = 1024 for any int8 q8, so a lane can take up to 31 products.
+static inline int16x8_t ggml_neon_mul_q4_0_q8_0(const block_q4_0 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y) {
+    const uint8x16_t qx = vld1q_u8(x->qs);
+
+    const int8x16_t xl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8  (qx, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+    const int8x16_t xh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx, 4)),                 vdupq_n_s8(8));
+
+    const int8x16_t yl = vld1q_s8(y->qs);
+    const int8x16_t yh = vld1q_s8(y->qs + 16);
+
+    int16x8_t acc = vmull_s8(vget_low_s8(xl), vget_low_s8(yl));
+    acc = vmlal_high_s8(acc, xl, yl);
+    acc = vmlal_s8     (acc, vget_low_s8(xh), vget_low_s8(yh));
+    return vmlal_high_s8(acc, xh, yh);
+}
+
+// the 32 products x * y of one q8_0 block pair, 8 per int32 lane.
+// Two products share an int16 lane first, which needs |x * y| <= 16383: true because y (src1, quantized by
+// quantize_row_q8_0) is in [-127, 127], so |x * y| <= 128*127 for any int8 x.
+static inline int32x4_t ggml_neon_mul_q8_0_q8_0(const block_q8_0 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y) {
+    const int8x16_t x0 = vld1q_s8(x->qs);
+    const int8x16_t x1 = vld1q_s8(x->qs + 16);
+    const int8x16_t y0 = vld1q_s8(y->qs);
+    const int8x16_t y1 = vld1q_s8(y->qs + 16);
+
+    const int16x8_t a0 = vmlal_high_s8(vmull_s8(vget_low_s8(x0), vget_low_s8(y0)), x0, y0);
+    const int16x8_t a1 = vmlal_high_s8(vmull_s8(vget_low_s8(x1), vget_low_s8(y1)), x1, y1);
+
+    return vpadalq_s16(vpaddlq_s16(a0), a1);
+}
+#endif
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -367,6 +413,33 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
             break;
     }
 
+#elif defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+    // no dotprod (e.g. Cortex-A57): 4 blocks per iteration, one int32 lane per block.
+    // int16 pairwise adds bring each block from 8 lanes of 4 products to 2 lanes of 16 products (<= 16384),
+    // then a widening pairwise add gives the block sums.
+    float32x4_t sumv = vdupq_n_f32(0.0f);
+
+    for (; ib < nb - 3; ib += 4) {
+        const int16x8_t p0 = ggml_neon_mul_q4_0_q8_0(&x[ib + 0], &y[ib + 0]);
+        const int16x8_t p1 = ggml_neon_mul_q4_0_q8_0(&x[ib + 1], &y[ib + 1]);
+        const int16x8_t p2 = ggml_neon_mul_q4_0_q8_0(&x[ib + 2], &y[ib + 2]);
+        const int16x8_t p3 = ggml_neon_mul_q4_0_q8_0(&x[ib + 3], &y[ib + 3]);
+
+        const int32x4_t isum = vpaddlq_s16(vpaddq_s16(vpaddq_s16(p0, p1), vpaddq_s16(p2, p3)));
+
+        const float32x4_t dx = ggml_neon_fp16x4_to_fp32(x[ib + 0].d, x[ib + 1].d, x[ib + 2].d, x[ib + 3].d);
+        const float32x4_t dy = ggml_neon_fp16x4_to_fp32(y[ib + 0].d, y[ib + 1].d, y[ib + 2].d, y[ib + 3].d);
+
+        sumv = vfmaq_f32(sumv, vcvtq_f32_s32(isum), vmulq_f32(dx, dy));
+    }
+
+    sumf = vaddvq_f32(sumv);
+
+    // remaining 1-3 blocks (or rows shorter than 4 blocks)
+    for (; ib < nb; ++ib) {
+        const int32_t isum = vaddlvq_s16(ggml_neon_mul_q4_0_q8_0(&x[ib], &y[ib]));
+        sumf += (float) isum * (GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+    }
 #elif defined(__ARM_NEON)
     float32x4_t sumv0 = vdupq_n_f32(0.0f);
     float32x4_t sumv1 = vdupq_n_f32(0.0f);
@@ -1081,6 +1154,31 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         default:
             assert(false && "Unsupported vector length");
             break;
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+    // no dotprod (e.g. Cortex-A57): 4 blocks per iteration, one int32 lane per block
+    float32x4_t sumv = vdupq_n_f32(0.0f);
+
+    for (; ib < nb - 3; ib += 4) {
+        const int32x4_t p0 = ggml_neon_mul_q8_0_q8_0(&x[ib + 0], &y[ib + 0]);
+        const int32x4_t p1 = ggml_neon_mul_q8_0_q8_0(&x[ib + 1], &y[ib + 1]);
+        const int32x4_t p2 = ggml_neon_mul_q8_0_q8_0(&x[ib + 2], &y[ib + 2]);
+        const int32x4_t p3 = ggml_neon_mul_q8_0_q8_0(&x[ib + 3], &y[ib + 3]);
+
+        const int32x4_t isum = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+
+        const float32x4_t dx = ggml_neon_fp16x4_to_fp32(x[ib + 0].d, x[ib + 1].d, x[ib + 2].d, x[ib + 3].d);
+        const float32x4_t dy = ggml_neon_fp16x4_to_fp32(y[ib + 0].d, y[ib + 1].d, y[ib + 2].d, y[ib + 3].d);
+
+        sumv = vfmaq_f32(sumv, vcvtq_f32_s32(isum), vmulq_f32(dx, dy));
+    }
+
+    sumf = vaddvq_f32(sumv);
+
+    // remaining 1-3 blocks (or rows shorter than 4 blocks)
+    for (; ib < nb; ++ib) {
+        const int32_t isum = vaddvq_s32(ggml_neon_mul_q8_0_q8_0(&x[ib], &y[ib]));
+        sumf += (float) isum * (GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
     }
 #elif defined(__ARM_NEON)
     float32x4_t sumv0 = vdupq_n_f32(0.0f);

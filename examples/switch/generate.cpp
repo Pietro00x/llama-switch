@@ -1,7 +1,9 @@
 #include "generate.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -131,7 +133,9 @@ static std::string reply_visible(const std::string & raw, const std::string & st
 struct chat_format {
     std::string tmpl;          // for llama_chat_apply_template; empty = plain "User:/Assistant:" transcript
     std::string system_prompt;
+    std::string bos;           // BOS text put in front of the rendered prompt (see template_bos)
     bool        no_think = false; // prefill an empty <think> block after the assistant header
+    std::string think_empty = k_think_empty; // that block, as the model's template writes it
 };
 
 static const model_entry * find_loaded_entry(const app_state & state) {
@@ -158,19 +162,42 @@ static bool chat_template_supported(const std::string & tmpl) {
     return llama_chat_apply_template(tmpl.c_str(), &msg, 1, true, nullptr, 0) >= 0;
 }
 
+// The built-in templates never emit BOS. A model whose own template starts with "{{ bos_token }}" and whose
+// tokenizer doesn't add BOS (LFM3) expects it as the first prompt token, so it is put in front as text.
+static std::string template_bos(const llama_vocab * vocab, const std::string & model_tmpl) {
+    const llama_token bos = llama_vocab_bos(vocab);
+    if (bos == LLAMA_TOKEN_NULL || llama_vocab_get_add_bos(vocab)) {
+        return "";
+    }
+    size_t i = model_tmpl.find_first_not_of(" \t\r\n");
+    if (i == std::string::npos || model_tmpl.compare(i, 2, "{{") != 0) {
+        return "";
+    }
+    i = model_tmpl.find_first_not_of("- \t", i + 2);
+    const size_t end = i + std::strlen("bos_token");
+    if (i == std::string::npos || model_tmpl.compare(i, end - i, "bos_token") != 0 ||
+        (end < model_tmpl.size() && (std::isalnum((unsigned char) model_tmpl[end]) || model_tmpl[end] == '_'))) {
+        return "";
+    }
+    const char * text = llama_vocab_get_text(vocab, bos);
+    return text ? text : "";
+}
+
 static chat_format chat_format_init(const app_state & state) {
     chat_format fmt;
-    const model_entry * entry = find_loaded_entry(state);
+    const model_entry * entry      = find_loaded_entry(state);
+    const char *        model_tmpl = llama_model_chat_template(state.model, nullptr);
     if (entry) {
         fmt.system_prompt = trim(entry->system_prompt);
         if (chat_template_supported(entry->chat_template)) {
             fmt.tmpl = entry->chat_template;
-            return fmt;
         }
     }
-    const char * tmpl = llama_model_chat_template(state.model, nullptr);
-    if (tmpl && chat_template_supported(tmpl)) {
-        fmt.tmpl = tmpl;
+    if (fmt.tmpl.empty() && model_tmpl && chat_template_supported(model_tmpl)) {
+        fmt.tmpl = model_tmpl;
+    }
+    if (!fmt.tmpl.empty() && model_tmpl) {
+        fmt.bos = template_bos(llama_model_get_vocab(state.model), model_tmpl);
     }
     return fmt;
 }
@@ -206,10 +233,14 @@ static llama_token single_token(const llama_vocab * vocab, const char * text) {
 }
 
 // "/no_think" in the system prompt disables reasoning the way the official Qwen3/SmolLM3 templates do:
-// the assistant turn starts with an empty <think> block (needed for Qwen3.5, which has no switch)
+// the assistant turn starts with an empty <think> block (needed for Qwen3.5 and LFM3, which have no switch)
 static void chat_format_init_no_think(chat_format & fmt, const llama_vocab * vocab) {
     fmt.no_think = !fmt.tmpl.empty() && fmt.system_prompt.find(k_no_think) != std::string::npos &&
         single_token(vocab, k_think_open) != LLAMA_TOKEN_NULL && single_token(vocab, k_think_close) != LLAMA_TOKEN_NULL;
+    // LFM3 writes the empty block without the Qwen-style newlines
+    if (fmt.tmpl.find("<think></think>") != std::string::npos) {
+        fmt.think_empty = "<think></think>";
+    }
 }
 
 static bool chat_format_apply(
@@ -224,7 +255,7 @@ static bool chat_format_apply(
     for (size_t i = start; i < turns.size(); ++i) {
         // with thinking disabled the empty block stays in front of old answers, exactly as it was
         // in the prompt, so the cached reply tokens still match
-        answers.push_back((fmt.no_think ? k_think_empty : "") + reply_strip_thinking(turns[i].assistant));
+        answers.push_back((fmt.no_think ? fmt.think_empty : "") + reply_strip_thinking(turns[i].assistant));
     }
 
     if (fmt.tmpl.empty()) {
@@ -262,9 +293,10 @@ static bool chat_format_apply(
     if (n < 0) {
         return false;
     }
-    out.assign(buf.data(), (size_t) n);
+    out = fmt.bos;
+    out.append(buf.data(), (size_t) n);
     if (fmt.no_think) {
-        out += k_think_empty;
+        out += fmt.think_empty;
     }
     return true;
 }
@@ -608,6 +640,13 @@ bool generate_assistant_reply(
             break;
         }
 
+        if (fmt.no_think && tok_open != LLAMA_TOKEN_NULL) {
+            // thinking is off: the model may not open a new reasoning block (LFM3 sometimes tries)
+            float * logits = llama_get_logits_ith(ctx, -1);
+            if (logits) {
+                logits[tok_open] = -INFINITY;
+            }
+        }
         llama_token tok = llama_sampler_sample(state.sampler, ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) {
             break;

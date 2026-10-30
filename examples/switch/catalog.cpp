@@ -10,8 +10,9 @@
 //     file size + KV cache (+ recurrent state) + compute buffer + ~100 MB app overhead <= ~3 GB
 //
 // KV bytes per token = n_attn_layers * n_head_kv * head_dim * 2 (K and V) * 2 bytes (F16).
-// The hybrid architectures (LFM2 conv+attention, Qwen3.5 Gated DeltaNet+attention and Granite 4.0-H
-// Mamba2+attention) keep KV only in their few attention layers. Their recurrent state is fixed-size,
+// The hybrid architectures (LFM2 conv+attention, LFM3 conv+sliding window/full attention, Qwen3.5 Gated
+// DeltaNet+attention and Granite 4.0-H Mamba2+attention) keep KV only in their few attention layers
+// (LFM3's sliding window layers only keep the last 256 tokens). Their recurrent state is fixed-size,
 // so a larger context costs them almost nothing. Plain transformers (Qwen3, SmolLM3) pay the full price.
 // Gemma 3 is iSWA, but llama.cpp allocates a full-size SWA cache by default, so all 26 layers count.
 //
@@ -42,28 +43,31 @@
 // "e" = estimated from config.json.
 //  #  model                         arch           file     ctx   KV/tok   KV+state  compute  total
 //  1  LFM2.5 1.2B Instruct QAD Q4_0 lfm2           696 MB   4096  12 KiB     48 m     136 m   ~0.9 GB
-//  2  Qwen3 1.7B Q4_K_M             qwen3          1.1 GB   4096  112 KiB   448 e     310 e   ~1.9 GB
-//  3  Gemma 3 1B IT Q4_K_M          gemma3         806 MB   4096  26 KiB    104 m     516 m   ~1.4 GB
-//  4  Qwen3.5 0.8B Q8_0             qwen35         812 MB   4096  12 KiB     67 m     489 m   ~1.4 GB
-//  5  Qwen3.5 2B Q4_K_M             qwen35         1.3 GB   4096  12 KiB     67 e     500 e   ~1.9 GB
-//  6  Granite 4.0 H 1B Q4_K_M       granitehybrid  901 MB   4096  8 KiB      87 m     213 m   ~1.2 GB
-//  7  Qwen3 0.6B Q8_0               qwen3          639 MB   4096  112 KiB   448 m     308 m   ~1.4 GB
-//  8  LFM2.5 350M Q8_0              lfm2           379 MB   4096  12 KiB     48 e     136 e   ~0.6 GB
-//  9  SmolLM3 3B Q4_K_M             smollm3        1.9 GB   2048  72 KiB    144 e     260 e   ~2.4 GB
+//  2  LFM3 1.7B QAD Q4_0            lfm3           1.05 GB  4096  12 KiB     88 m     258 m   ~1.4 GB
+//  3  Qwen3 1.7B Q4_K_M             qwen3          1.1 GB   4096  112 KiB   448 e     310 e   ~1.9 GB
+//  4  Gemma 3 1B IT Q4_K_M          gemma3         806 MB   4096  26 KiB    104 m     516 m   ~1.4 GB
+//  5  Qwen3.5 0.8B Q8_0             qwen35         812 MB   4096  12 KiB     67 m     489 m   ~1.4 GB
+//  6  Qwen3.5 2B Q4_K_M             qwen35         1.3 GB   4096  12 KiB     67 e     500 e   ~1.9 GB
+//  7  Granite 4.0 H 1B Q4_K_M       granitehybrid  901 MB   4096  8 KiB      87 m     213 m   ~1.2 GB
+//  8  Qwen3 0.6B Q8_0               qwen3          639 MB   4096  112 KiB   448 m     308 m   ~1.4 GB
+//  9  LFM2.5 350M Q8_0              lfm2           379 MB   4096  12 KiB     48 e     136 e   ~0.6 GB
+// 10  SmolLM3 3B Q4_K_M             smollm3        1.9 GB   2048  72 KiB    144 e     260 e   ~2.4 GB
 //
 // Why these models:
 //   1. The best default: fast (10 conv + 6 attention layers) and a good chat model, with a QAD-tuned Q4_0.
-//   2. The strongest reasoning and multilingual model that stays comfortably inside the budget.
-//   3. Google's instruct model, good at writing.
-//   4. The newest Qwen generation: 18 DeltaNet + 6 attention layers, non-thinking by default.
-//   5. A bigger Qwen3.5 with the same tiny KV cache, but slower.
-//   6. IBM's hybrid model (36 Mamba2 + 4 attention layers).
-//   7. A small, quick fallback from the official Qwen GGUF repo.
-//   8. The smallest and fastest; good for extraction and short answers.
-//   9. The largest model that fits. It is slow, and SmolLM3 thinks by default.
+//   2. Liquid's next generation (13 conv + 5 sliding window + 6 full attention layers), also QAD-tuned.
+//      Better answers than 1., but slower. It thinks by default.
+//   3. The strongest reasoning and multilingual model that stays comfortably inside the budget.
+//   4. Google's instruct model, good at writing.
+//   5. The newest Qwen generation: 18 DeltaNet + 6 attention layers, non-thinking by default.
+//   6. A bigger Qwen3.5 with the same tiny KV cache, but slower.
+//   7. IBM's hybrid model (36 Mamba2 + 4 attention layers).
+//   8. A small, quick fallback from the official Qwen GGUF repo.
+//   9. The smallest and fastest; good for extraction and short answers.
+//  10. The largest model that fits. It is slow, and SmolLM3 thinks by default.
 //
 // Every GGUF above carries a chat template that llm_chat_detect_template() maps to a built-in one:
-// chatml (LFM2.5, Qwen3, Qwen3.5, SmolLM3), gemma and granite. So chat_template stays empty.
+// chatml (LFM2.5, LFM3, Qwen3, Qwen3.5, SmolLM3), gemma and granite. So chat_template stays empty.
 //
 // Models considered and left out:
 //   - Gemma 3n E2B: the smallest Q4 is ~3.0 GB and its per-layer embeddings must stay resident.
@@ -74,13 +78,15 @@
 //   - google/gemma-3-1b-it-qat-q4_0-gguf: gated repo (HTTP 401 without a token), so it can't be downloaded.
 //
 // Sampling defaults follow each model card. The app's sampler chain has no repetition or presence
-// penalty, so the LFM2.5 temperature is raised from the card's 0.1 to 0.3 to avoid greedy loops.
+// penalty, so the LFM2.5 and LFM3 temperature is raised from the card's 0.1 to 0.3 to avoid greedy loops.
 // "/no_think" is the documented Qwen3/SmolLM3 system-prompt switch that skips the <think> phase.
 // On an A57 that phase can cost hundreds of tokens (minutes) before the first visible word.
 // The switch only holds across turns if earlier <think>...</think> blocks are dropped from the history,
 // which is what the official template does. Qwen3.5 has no /no_think switch of its own, but generate.cpp
 // treats "/no_think" in the system prompt as "start the reply with an empty <think></think>" (what the
-// official Qwen templates do to disable thinking), so it is set for the Qwen3.5 entries too.
+// official Qwen templates do to disable thinking), so it is set for the Qwen3.5 and LFM3 entries too.
+// It also keeps the model from opening a new <think> block after the empty one, which LFM3 otherwise
+// does now and then (the LFM3 model card warns that its thinking switch is not fully reliable).
 
 static constexpr const char * k_models_dir = "sdmc:/switch/llama_cpp_switch/models/";
 
@@ -102,6 +108,8 @@ std::vector<model_entry> default_models() {
     return {
         make_entry("LFM2.5 1.2B Instruct Q4_0 (696 MB)", "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
                    "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf", 4096, 0.3f, 0.95f, 50, ""),
+        make_entry("LFM3 1.7B Q4_0 (1.05 GB)", "LiquidAI/LFM3-1.7B-GGUF",
+                   "LFM3-1.7B-QAD-Q4_0.gguf", 4096, 0.3f, 0.95f, 50, "/no_think"),
         make_entry("Qwen3 1.7B Q4_K_M (1.1 GB)", "unsloth/Qwen3-1.7B-GGUF",
                    "Qwen3-1.7B-Q4_K_M.gguf", 4096, 0.7f, 0.8f, 20, "/no_think"),
         make_entry("Gemma 3 1B IT Q4_K_M (806 MB)", "ggml-org/gemma-3-1b-it-GGUF",

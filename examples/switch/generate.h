@@ -39,7 +39,8 @@ using gen_partial_cb = std::function<bool(const std::string & partial, const gen
 // be empty if it was cancelled during the prompt evaluation).
 // Budgets: at most 1024 answer tokens; a <think> block is closed by force after 1024 tokens or when
 // the context is nearly full, so an answer always follows. "/no_think" in the model's system prompt
-// starts the assistant turn with an empty <think> block (Qwen3 / Qwen3.5 / SmolLM3 style).
+// starts the assistant turn with an empty <think> block (Qwen3 / Qwen3.5 / SmolLM3 / LFM3 style) and
+// keeps the model from opening a new one.
 bool generate_assistant_reply(
     app_state & state,
     const std::string & user_input,

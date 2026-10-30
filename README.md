@@ -33,6 +33,7 @@ The app keeps its model list in `sdmc:/switch/llama_cpp_switch/models.json`. It 
 | Model | Quant | Download | Context |
 |---|---|---|---|
 | LFM2.5 1.2B Instruct (QAD) | Q4_0 | 696 MB | 4096 |
+| LFM3 1.7B (QAD) | Q4_0 | 1.05 GB | 4096 |
 | Qwen3 1.7B | Q4_K_M | 1.1 GB | 4096 |
 | Gemma 3 1B IT | Q4_K_M | 806 MB | 4096 |
 | Qwen3.5 0.8B | Q8_0 | 812 MB | 4096 |
@@ -42,7 +43,7 @@ The app keeps its model list in `sdmc:/switch/llama_cpp_switch/models.json`. It 
 | LFM2.5 350M | Q8_0 | 379 MB | 4096 |
 | SmolLM3 3B | Q4_K_M | 1.9 GB | 2048 |
 
-LFM2.5 1.2B is the recommended starting point. SmolLM3 3B is the largest model that fits and is slow. The Qwen and SmolLM3 entries use `/no_think` as their system prompt, so they answer directly instead of spending minutes on a thinking phase first.
+LFM2.5 1.2B is the recommended starting point. LFM3 1.7B gives better answers but is slower. SmolLM3 3B is the largest model that fits and is slow. The Qwen, LFM3 and SmolLM3 entries use `/no_think` as their system prompt, so they answer directly instead of spending minutes on a thinking phase first. Clear the system prompt in `models.json` to let them think.
 
 ### Using your own models
 
@@ -148,6 +149,7 @@ Most of the tree is unmodified upstream code. The port consists of:
   - dynamic backend loading stubbed out (no `dlopen`)
   - thread pinning with `svcSetThreadCoreMask`
   - a few header exclusions in `cpp-httplib`
+- **LFM3 support** (`src/models/lfm3.cpp`), backported from upstream llama.cpp ([#31252](https://github.com/ggml-org/llama.cpp/pull/31252)) because this snapshot predates it.
 - **Cortex-A57 kernels** in `ggml/src/ggml-cpu/arch/arm/`, enabled on any AArch64 CPU without dotprod:
   - a 4-row Q4_0/Q8_0 GEMV for single-token decode
   - rewritten no-dotprod `vec_dot`s for Q4_0, Q8_0, Q4_K, Q5_K and Q6_K

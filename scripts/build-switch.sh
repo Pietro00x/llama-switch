@@ -33,6 +33,15 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     fi
 fi
 
+# keep the checkout path (usually under the builder's home directory) out of the __FILE__ strings that
+# GGML_ASSERT/GGML_ABORT embed in the .nro. CMake can't carry a flag containing whitespace, so such a
+# checkout builds without the mapping.
+PREFIX_MAP=""
+case "$ROOT" in
+    *[[:space:]]*) echo "warning: '$ROOT' contains whitespace, the .nro will embed the full source paths" >&2 ;;
+    *)             PREFIX_MAP="-ffile-prefix-map=$ROOT/=" ;;
+esac
+
 # CPU code generation for the Tegra X1 (Cortex-A57, ARMv8.0-A):
 #   - GGML_CPU_ARM_ARCH pins ggml-cpu to ARMv8.0 + NEON (+crc/crypto, same as the devkitA64 defaults).
 #     The A57 has no dotprod, i8mm, fp16 vector arithmetic, SVE or LSE atomics - code using any of them
@@ -45,8 +54,8 @@ fi
 # Options passed on the command line come last and override these.
 "$SWITCH_CMAKE" -S "$ROOT" -B "$BUILD_DIR" "${GEN_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_FLAGS_RELEASE="-g -O3 -DNDEBUG" \
-    -DCMAKE_CXX_FLAGS_RELEASE="-g -O3 -DNDEBUG" \
+    -DCMAKE_C_FLAGS_RELEASE="-g -O3 -DNDEBUG $PREFIX_MAP" \
+    -DCMAKE_CXX_FLAGS_RELEASE="-g -O3 -DNDEBUG $PREFIX_MAP" \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_NATIVE=OFF \
     -DGGML_CPU_ARM_ARCH=armv8-a+crc+crypto \

@@ -131,7 +131,11 @@ The build pins ggml-cpu to ARMv8.0 (`armv8-a+crc+crypto`). Never raise this: the
 
 ### Releases
 
-`release-assets/llama-switch.nro` is a committed prebuilt binary. Pushing a `v*` tag runs `.github/workflows/switch-release.yml`, which attaches that file to a GitHub release (it does not build anything). Rebuild and commit the `.nro` before tagging.
+`release-assets/llama-switch.nro` is a committed prebuilt binary. To publish a release, rebuild and commit it, then attach it to a new release:
+
+```bash
+gh release create vX.Y.Z release-assets/llama-switch.nro --title "llama.cpp for Nintendo Switch X.Y.Z"
+```
 
 ## Changes from upstream llama.cpp
 
